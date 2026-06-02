@@ -1,0 +1,22 @@
+{
+  "brandTerms": [
+    {
+      "term": "premier pro",
+      "preferred": "Premiere Pro",
+      "caseSensitive": false,
+      "note": "Adobe product spelling"
+    },
+    {
+      "term": "premiere pro",
+      "preferred": "Premiere Pro",
+      "caseSensitive": false,
+      "note": "Adobe product capitalization"
+    },
+    {
+      "term": "adobe premier",
+      "preferred": "Adobe Premiere Pro",
+      "caseSensitive": false,
+      "note": "Use full product name"
+    }
+  ]
+}

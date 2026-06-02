@@ -1,0 +1,7 @@
+{
+  "version": "0.1.38",
+  "file": "com.subtitleqa.panel_premierepro.ccx",
+  "ccxUrl": "https://raw.githubusercontent.com/contentkueche/subtitle-qa/main/release/com.subtitleqa.panel_premierepro.ccx",
+  "sha256": "56b725109bb881e2c26f3d40d4e85704c8febbff77be2f2b6b6d2e253316ed26",
+  "notes": "Shared SharePoint glossary support and transcript apply fixes."
+}

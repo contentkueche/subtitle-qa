@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Subtitle QA</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main id="app" class="panel-shell" aria-label="Subtitle QA panel">
+      <header class="topbar">
+        <div>
+          <h1>Subtitle QA</h1>
+          <p>Native subtitle QA inside Premiere Pro.</p>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="Views">
+        <button id="issuesTab" class="tab active" type="button">Issues</button>
+        <button id="debugTab" class="tab" type="button">Debug</button>
+      </nav>
+
+      <section id="issuesView" class="view active" aria-live="polite">
+        <section class="premiere-body-controls" aria-label="Subtitle QA controls">
+          <p id="statusText">Ready to scan the active Premiere sequence.</p>
+          <div class="primary-row">
+            <select id="languageMode" class="mode-select" aria-label="Language mode">
+              <option value="auto" selected>Auto</option>
+              <option value="de">German</option>
+              <option value="en">English</option>
+            </select>
+            <button id="cleanTranscriptButton" class="primary-button" type="button">Clean Transcript (OpenAI)</button>
+            <button id="checkButton" type="button">Check Subtitles</button>
+            <button id="loadGlossaryButton" type="button">Glossary</button>
+          </div>
+          <div class="secondary-row">
+            <button id="acceptAllButton" type="button">Accept All</button>
+            <button id="rejectAllButton" type="button">Reject All</button>
+            <button id="applyButton" type="button" disabled>Apply Accepted</button>
+          </div>
+          <section class="summary-band" aria-label="Scan summary">
+            <div>
+              <span class="metric-value" id="issueCount">0</span>
+              <span class="metric-label">issues</span>
+            </div>
+            <div>
+              <span class="metric-value" id="acceptedCount">0</span>
+              <span class="metric-label">accepted</span>
+            </div>
+            <div>
+              <span class="metric-value" id="sourceMode">-</span>
+              <span class="metric-label">source</span>
+            </div>
+          </section>
+        </section>
+        <section id="glossaryEditor" class="glossary-editor" aria-label="Glossary editor">
+          <div class="glossary-editor-header">
+            <strong>Glossary Terms</strong>
+            <div class="glossary-editor-actions">
+              <button id="glossaryImportButton" type="button">Import JSON</button>
+              <button id="glossarySaveButton" class="primary-button" type="button">Save Glossary</button>
+              <button id="glossaryCloseButton" type="button">Close</button>
+            </div>
+          </div>
+          <div class="glossary-form">
+            <input id="glossaryTermInput" type="text" spellcheck="false" placeholder="Current term (e.g. roth kegel)" />
+            <input id="glossaryPreferredInput" type="text" spellcheck="false" placeholder="Preferred term (e.g. Rothkegel)" />
+            <select id="glossaryLanguageInput" aria-label="Glossary language">
+              <option value="all" selected>All languages</option>
+              <option value="de">German</option>
+              <option value="en">English</option>
+            </select>
+            <input id="glossaryNoteInput" type="text" spellcheck="false" placeholder="Note (optional)" />
+            <label class="glossary-checkbox">
+              <input id="glossaryCaseSensitiveInput" type="checkbox" />
+              <span>Case sensitive</span>
+            </label>
+            <button id="glossaryAddButton" type="button">Add Term</button>
+          </div>
+          <div id="glossaryList" class="glossary-list"></div>
+        </section>
+        <div id="emptyState" class="empty-state">
+          <p>Run a scan to review spelling, grammar, punctuation, and glossary findings.</p>
+          <div class="empty-actions">
+            <button id="emptyTranscriptButton" class="primary-button empty-check-button" type="button">Clean Transcript (OpenAI)</button>
+            <button id="emptyCheckButton" class="empty-check-button" type="button">Check Subtitles</button>
+          </div>
+        </div>
+        <ol id="issueList" class="issue-list"></ol>
+      </section>
+
+      <section id="debugView" class="view">
+        <section class="debug-panel" aria-label="Debug Log">
+          <div class="debug-actions">
+            <button id="selectDebugButton" class="debug-copy-button" type="button">Select Debug</button>
+            <button id="toggleEngineSettingsButton" class="debug-copy-button" type="button">Engine Settings</button>
+          </div>
+          <div id="engineSettingsPanel" class="engine-settings-panel">
+            <div class="engine-settings-grid">
+              <select id="spellingEngineMode" aria-label="Spelling engine">
+                <option value="local" selected>Local Spelling</option>
+                <option value="openai">OpenAI Spelling</option>
+                <option value="openai_full">OpenAI Full QA</option>
+              </select>
+              <input
+                id="openAiApiKey"
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="OpenAI API key"
+                aria-label="OpenAI API key"
+              />
+              <input id="openAiModel" type="text" spellcheck="false" value="gpt-4.1-mini" aria-label="OpenAI model" />
+              <button id="saveOpenAiSettingsButton" type="button">Save Engine</button>
+            </div>
+          </div>
+          <textarea id="debugLog" class="debug-log" readonly spellcheck="false"></textarea>
+        </section>
+      </section>
+    </main>
+    <script src="index.js"></script>
+  </body>
+</html>

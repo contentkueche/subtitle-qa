@@ -1,0 +1,19 @@
+{
+  "name": "subtitle-qa",
+  "version": "0.1.38",
+  "private": true,
+  "description": "Adobe Premiere Pro UXP plugin for native subtitle QA.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "clean": "node scripts/build.mjs --clean"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "typescript": "^5.9.3"
+  }
+}
