@@ -1,6 +1,7 @@
 param(
   [string]$LatestJsonUrl = "https://raw.githubusercontent.com/contentkueche/subtitle-qa/main/release/latest.json",
-  [string]$InstallStateDir = "$env:LOCALAPPDATA\Contentkueche\Subtitle QA"
+  [string]$InstallStateDir = "$env:LOCALAPPDATA\Contentkueche\Subtitle QA",
+  [switch]$ForceReinstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,6 +82,17 @@ function Set-InstalledVersion {
   Set-Content -Path (Join-Path $StateDir "installed-version.txt") -Value $Version -Encoding UTF8
 }
 
+function Test-UpiaPluginInstalled {
+  param([string]$UpiaPath)
+
+  try {
+    $listOutput = (& $UpiaPath /list all 2>&1 | Out-String)
+    return ($listOutput -match "Subtitle QA" -or $listOutput -match "com\.subtitleqa\.panel")
+  } catch {
+    return $false
+  }
+}
+
 Write-Step "Reading Subtitle QA release manifest"
 $latest = Get-LatestManifest -Uri $LatestJsonUrl
 
@@ -99,14 +111,18 @@ if ($installedVersion -ne "") {
 Write-Host "Installed version: $installedLabel"
 Write-Host "Latest version:    $($latest.version)"
 
-if ($installedVersion -eq $latest.version) {
-  Write-Host "Subtitle QA is already up to date." -ForegroundColor Green
-  exit 0
-}
-
 Write-Step "Finding Adobe UPIA installer"
 $upia = Get-UpiaPath
 Write-Host "UPIA: $upia"
+
+if (($installedVersion -eq $latest.version) -and (-not $ForceReinstall)) {
+  if (Test-UpiaPluginInstalled -UpiaPath $upia) {
+    Write-Host "Subtitle QA is already up to date and listed by Adobe UPIA." -ForegroundColor Green
+    exit 0
+  }
+
+  Write-Host "Version marker exists, but Adobe UPIA does not list Subtitle QA. Reinstalling..." -ForegroundColor Yellow
+}
 
 Write-Step "Downloading Subtitle QA $($latest.version)"
 New-Item -ItemType Directory -Path $InstallStateDir -Force | Out-Null
@@ -128,9 +144,13 @@ if ($latest.sha256) {
 }
 
 Write-Step "Installing Subtitle QA $($latest.version)"
-& $upia --install $ccxPath
+& $upia /install $ccxPath
 if ($LASTEXITCODE -ne 0) {
   throw "UPIA install failed with exit code $LASTEXITCODE."
+}
+
+if (-not (Test-UpiaPluginInstalled -UpiaPath $upia)) {
+  throw "UPIA finished, but Subtitle QA is not listed as installed. Run Creative Cloud Desktop once, update Premiere Pro to 25.6+, then rerun with -ForceReinstall."
 }
 
 Set-InstalledVersion -StateDir $InstallStateDir -Version $latest.version

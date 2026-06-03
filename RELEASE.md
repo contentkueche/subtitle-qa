@@ -39,6 +39,12 @@ Run PowerShell on each cutter PC:
 powershell -ExecutionPolicy Bypass -File .\install\update-subtitle-qa.ps1
 ```
 
+If a machine previously reported success but the panel does not appear in Premiere, force a reinstall:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install\update-subtitle-qa.ps1 -ForceReinstall
+```
+
 The script:
 
 - downloads `latest.json`
@@ -46,6 +52,7 @@ The script:
 - verifies the SHA-256 hash
 - finds Adobe `UnifiedPluginInstallerAgent.exe`
 - installs the plugin through UPIA
+- verifies that Adobe UPIA lists `Subtitle QA` after installation
 - stores the installed version under `%LOCALAPPDATA%\Contentkueche\Subtitle QA`
 
 Restart Premiere Pro after install/update.
