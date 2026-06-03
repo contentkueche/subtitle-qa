@@ -122,94 +122,6 @@ ${safeJson(entry.data)}`;
   function makeIssueId(targetId, ruleId, start, end) {
     return `${targetId}:${ruleId}:${start}:${end}`;
   }
-  function computeReplacementsFromTexts(original, corrected) {
-    if (original === corrected) {
-      return [];
-    }
-    const n = original.length;
-    const m = corrected.length;
-    const lcs = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
-    for (let i2 = n - 1; i2 >= 0; i2 -= 1) {
-      for (let j2 = m - 1; j2 >= 0; j2 -= 1) {
-        if (original[i2] === corrected[j2]) {
-          lcs[i2][j2] = 1 + lcs[i2 + 1][j2 + 1];
-        } else {
-          lcs[i2][j2] = Math.max(lcs[i2 + 1][j2], lcs[i2][j2 + 1]);
-        }
-      }
-    }
-    const ops = [];
-    let i = 0;
-    let j = 0;
-    while (i < n && j < m) {
-      if (original[i] === corrected[j]) {
-        ops.push({ kind: "equal", value: original[i] });
-        i += 1;
-        j += 1;
-        continue;
-      }
-      if (lcs[i + 1][j] >= lcs[i][j + 1]) {
-        ops.push({ kind: "delete", value: original[i] });
-        i += 1;
-      } else {
-        ops.push({ kind: "insert", value: corrected[j] });
-        j += 1;
-      }
-    }
-    while (i < n) {
-      ops.push({ kind: "delete", value: original[i] });
-      i += 1;
-    }
-    while (j < m) {
-      ops.push({ kind: "insert", value: corrected[j] });
-      j += 1;
-    }
-    const replacements = [];
-    let originalIndex = 0;
-    let changeStart = -1;
-    let inserted = "";
-    const flush = () => {
-      if (changeStart < 0) {
-        return;
-      }
-      replacements.push({
-        start: changeStart,
-        end: originalIndex,
-        replacement: inserted
-      });
-      changeStart = -1;
-      inserted = "";
-    };
-    for (const op of ops) {
-      if (op.kind === "equal") {
-        flush();
-        originalIndex += 1;
-        continue;
-      }
-      if (changeStart < 0) {
-        changeStart = originalIndex;
-      }
-      if (op.kind === "delete") {
-        originalIndex += 1;
-      } else {
-        inserted += op.value;
-      }
-    }
-    flush();
-    return dedupeReplacements(replacements);
-  }
-  function dedupeReplacements(replacements) {
-    const seen = /* @__PURE__ */ new Set();
-    const result = [];
-    for (const replacement of replacements) {
-      const key = `${replacement.start}:${replacement.end}:${replacement.replacement}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        result.push(replacement);
-      }
-    }
-    return result;
-  }
   function dedupeIssuesByReplacement(issues) {
     const seen = /* @__PURE__ */ new Set();
     const result = [];
@@ -581,308 +493,6 @@ ${safeJson(entry.data)}`;
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
-  // src/domain/openAiSpellingEngine.ts
-  var OpenAiSpellingEngine = class {
-    constructor(endpoint = "https://api.openai.com/v1/responses", timeoutMs = 2e4) {
-      this.endpoint = endpoint;
-      this.timeoutMs = timeoutMs;
-    }
-    async checkTargets(targets, language, settings) {
-      return this.checkTargetsWithGlossary(targets, language, settings, { brandTerms: [] });
-    }
-    async checkTargetsWithGlossary(targets, language, settings, glossary) {
-      if (settings.mode === "local") {
-        return [];
-      }
-      const apiKey = settings.apiKey.trim();
-      if (!apiKey) {
-        throw new Error("OpenAI mode is enabled, but no API key is configured.");
-      }
-      const model = settings.model.trim() || "gpt-4.1-mini";
-      const isFullQaMode = settings.mode === "openai_full";
-      const payload = buildRequestPayload(targets, language, model, isFullQaMode ? "full" : "spelling", glossary);
-      const responseJson = await this.postJson(payload, apiKey);
-      const parsed = parseSpellingResponse(responseJson);
-      const mapped = new Map(parsed.corrections.map((item) => [item.id, item.corrected]));
-      const issues = [];
-      for (const target of targets) {
-        const corrected = mapped.get(target.id);
-        if (!corrected || corrected === target.originalText) {
-          continue;
-        }
-        const replacements = computeReplacementsFromTexts(target.originalText, corrected).filter(
-          (replacement) => isFullQaMode ? isFullQaReplacement(target.originalText, replacement) : isOrthographyReplacement(target.originalText, replacement)
-        );
-        if (replacements.length === 0) {
-          continue;
-        }
-        const correctedFromAllowed = replacements.slice().sort((a, b) => b.start - a.start || b.end - a.end).reduce((text, replacement) => applyReplacement(text, replacement), target.originalText);
-        for (const replacement of replacements) {
-          const issueType = isFullQaMode ? classifyFullQaIssueType(target.originalText.slice(replacement.start, replacement.end), replacement.replacement) : "spelling";
-          const message = isFullQaMode ? messageForFullQaIssueType(issueType) : "Spelling suggestion from OpenAI.";
-          issues.push({
-            id: makeIssueId(target.id, "openai-spelling", replacement.start, replacement.end),
-            targetId: target.id,
-            type: issueType,
-            severity: "warning",
-            ruleId: isFullQaMode ? "openai-full-qa" : "openai-spelling",
-            message,
-            originalText: target.originalText,
-            suggestedText: correctedFromAllowed,
-            replacement,
-            status: "pending",
-            target
-          });
-        }
-      }
-      return issues;
-    }
-    async postJson(payload, apiKey) {
-      const controller = typeof AbortController !== "undefined" ? new AbortController() : void 0;
-      const timeout = controller ? setTimeout(() => {
-        controller.abort();
-      }, this.timeoutMs) : void 0;
-      try {
-        const response = await fetch(this.endpoint, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${apiKey}`
-          },
-          body: JSON.stringify(payload),
-          signal: controller?.signal
-        });
-        if (!response.ok) {
-          let detail = "";
-          try {
-            const body = await response.text();
-            detail = body ? ` ${body.slice(0, 400)}` : "";
-          } catch {
-          }
-          throw new Error(`OpenAI request failed with HTTP ${response.status}.${detail}`);
-        }
-        return await response.json();
-      } finally {
-        if (timeout) {
-          clearTimeout(timeout);
-        }
-      }
-    }
-  };
-  function buildRequestPayload(targets, language, model, mode, glossary) {
-    const languageMode = language === "de" ? "German" : language === "en" ? "English" : "Auto-detect per subtitle line (German or English)";
-    const glossaryTerms = glossary.brandTerms.slice(0, 300).map((term) => ({
-      term: term.term,
-      preferred: term.preferred,
-      language: term.language ?? "both",
-      caseSensitive: term.caseSensitive ?? false,
-      note: term.note ?? ""
-    }));
-    const userPayload = {
-      languageMode,
-      glossaryTerms,
-      targets: targets.map((target, index) => ({
-        id: target.id,
-        text: target.originalText,
-        languageHint: detectLanguageHint(target.originalText),
-        previousLine: index > 0 ? targets[index - 1].originalText : "",
-        nextLine: index + 1 < targets.length ? targets[index + 1].originalText : ""
-      }))
-    };
-    return {
-      model,
-      input: [
-        {
-          role: "system",
-          content: [
-            {
-              type: "input_text",
-              text: [
-                "You are a subtitle orthography checker for Adobe Premiere captions.",
-                ...mode === "spelling" ? [
-                  "Return corrections for spelling and obvious written-form errors.",
-                  "Use sentence meaning and nearby subtitle context to decide whether a word is misspelled.",
-                  "You may fix real-word spelling confusion when context clearly indicates a typo.",
-                  "Fix capitalization when required by language orthography.",
-                  "For German lines, correct noun capitalization when clearly identifiable from context.",
-                  "Actively validate names in location/company contexts (for example after 'in', 'bei', 'aus', or in phrases like 'bei der Firma ...').",
-                  "Correct clear proper-name/place-name misspellings when confidence is high (example: Gautingen -> Gauting).",
-                  "When a company, product, person, or location appears in glossaryTerms, use the preferred form exactly.",
-                  "For likely company names spanning multiple words, normalize obvious spacing or hyphenation issues when confidence is high (example: Roth Kegel -> Roth-Kegel).",
-                  "Fix obvious repeated-letter typos (example: Checkk -> Check).",
-                  "If a proper name is uncertain, keep it unchanged.",
-                  "You may fix obvious casing and apostrophes needed for correct written form.",
-                  "You may fix very short colloquial misspellings when context is clear (example: German 'net' -> 'nicht').",
-                  "Do not insert or move punctuation unless needed to preserve the corrected word form itself."
-                ] : [
-                  "Return corrections for spelling, grammar, punctuation, spacing, and obvious typo-related word choice errors.",
-                  "Use sentence meaning and nearby subtitle context. Fix obvious errors even inside long transcript blocks.",
-                  "Actively validate names in location/company contexts (for example after 'in', 'bei', 'aus', or in phrases like 'bei der Firma ...').",
-                  "When a company, product, person, or location appears in glossaryTerms, use the preferred form exactly.",
-                  "For likely company names spanning multiple words, normalize obvious spacing or hyphenation issues when confidence is high (example: Roth Kegel -> Roth-Kegel).",
-                  "Preserve tone and meaning; keep subtitle-friendly brevity.",
-                  "For German, apply correct noun capitalization and natural punctuation/spacing.",
-                  "For mixed German/English text, keep words in their source language and only correct the faulty parts.",
-                  "Fix obvious malformed constructions like missing spaces after commas and unnecessary inline dashes.",
-                  "If text has clear mistakes, do not return it unchanged.",
-                  "Examples of expected fixes: 'Dont' -> 'Don't', 'the premier pro test' -> 'the Premiere Pro test', 'bestimt' -> 'bestimmt'.",
-                  "If a phrase is ambiguous, prefer minimal safe edits."
-                ],
-                "Do not rewrite style or change the meaning.",
-                "Do not paraphrase or reorder text.",
-                "Return every target id once. If no fix is needed, return the original text unchanged."
-              ].join(" ")
-            }
-          ]
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: JSON.stringify(userPayload)
-            }
-          ]
-        }
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "subtitle_spelling_response",
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              corrections: {
-                type: "array",
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    id: { type: "string" },
-                    corrected: { type: "string" }
-                  },
-                  required: ["id", "corrected"]
-                }
-              }
-            },
-            required: ["corrections"]
-          },
-          strict: true
-        }
-      }
-    };
-  }
-  function parseSpellingResponse(raw) {
-    const direct = raw?.output_text;
-    if (typeof direct === "string" && direct.trim()) {
-      return validateSpellingResponse(JSON.parse(direct));
-    }
-    if (Array.isArray(direct)) {
-      const joined = direct.filter((part) => typeof part === "string").join("");
-      if (joined.trim()) {
-        return validateSpellingResponse(JSON.parse(joined));
-      }
-    }
-    const output = Array.isArray(raw?.output) ? raw.output : [];
-    const textParts = [];
-    for (const item of output) {
-      const content = Array.isArray(item?.content) ? item.content : [];
-      for (const block of content) {
-        if (typeof block?.text === "string") {
-          textParts.push(block.text);
-        }
-      }
-    }
-    const combined = textParts.join("");
-    if (combined.trim()) {
-      return validateSpellingResponse(JSON.parse(combined));
-    }
-    throw new Error("OpenAI response did not contain parsable JSON spelling output.");
-  }
-  function validateSpellingResponse(value) {
-    if (!value || typeof value !== "object") {
-      throw new Error("OpenAI response JSON is not an object.");
-    }
-    const corrections = value.corrections;
-    if (!Array.isArray(corrections)) {
-      throw new Error("OpenAI response JSON is missing corrections[].");
-    }
-    return {
-      corrections: corrections.map((entry, index) => {
-        const item = entry;
-        if (typeof item?.id !== "string" || typeof item?.corrected !== "string") {
-          throw new Error(`OpenAI correction at index ${index} is invalid.`);
-        }
-        return { id: item.id, corrected: item.corrected };
-      })
-    };
-  }
-  function isOrthographyReplacement(originalText, replacement) {
-    const originalSegment = originalText.slice(replacement.start, replacement.end);
-    if (isCaseOnlyChange(originalSegment, replacement.replacement)) {
-      return false;
-    }
-    if (replacement.replacement.includes("  ")) {
-      return false;
-    }
-    const allowedChars = /^[\p{L}\p{M}\p{N}'’\- ]*$/u;
-    if (!allowedChars.test(originalSegment) || !allowedChars.test(replacement.replacement)) {
-      return false;
-    }
-    return true;
-  }
-  function isFullQaReplacement(originalText, replacement) {
-    const originalSegment = originalText.slice(replacement.start, replacement.end);
-    if (replacement.replacement.length > Math.max(32, originalSegment.length + 20)) {
-      return false;
-    }
-    return true;
-  }
-  function isCaseOnlyChange(original, replacement) {
-    if (original === replacement) {
-      return false;
-    }
-    return original.toLocaleLowerCase("de-DE") === replacement.toLocaleLowerCase("de-DE");
-  }
-  function detectLanguageHint(text) {
-    const sample = text.toLowerCase();
-    let germanScore = 0;
-    let englishScore = 0;
-    if (/[äöüß]/i.test(sample)) {
-      germanScore += 3;
-    }
-    if (/\b(der|die|das|und|nicht|mit|ist|sind|wir|ihr|für|auch|aber)\b/.test(sample)) {
-      germanScore += 2;
-    }
-    if (/\b(the|and|not|with|is|are|we|you|for|also|this|that|but)\b/.test(sample)) {
-      englishScore += 2;
-    }
-    if (germanScore >= 2 && englishScore >= 2) {
-      return "mixed";
-    }
-    return germanScore >= englishScore ? "de" : "en";
-  }
-  function classifyFullQaIssueType(originalSegment, replacement) {
-    if (originalSegment === replacement) {
-      return "spelling";
-    }
-    const punctuationOrSpacing = /[\s.,;:!?'"-]/;
-    if (punctuationOrSpacing.test(originalSegment) || punctuationOrSpacing.test(replacement) || originalSegment.trim().length === 0 || replacement.trim().length === 0) {
-      return "punctuation";
-    }
-    return "grammar";
-  }
-  function messageForFullQaIssueType(type) {
-    if (type === "punctuation") {
-      return "Sentence QA suggestion from OpenAI (punctuation/spacing).";
-    }
-    if (type === "grammar") {
-      return "Sentence QA suggestion from OpenAI (grammar/wording).";
-    }
-    return "Sentence QA suggestion from OpenAI.";
-  }
-
   // src/domain/openAiTranscriptCleanupEngine.ts
   var FULL_TRANSCRIPT_REWRITE_RULE_ID = "openai-transcript-rewrite";
   var OpenAiTranscriptCleanupEngine = class {
@@ -896,7 +506,7 @@ ${safeJson(entry.data)}`;
         throw new Error("Clean Transcript needs an OpenAI API key in Engine Settings.");
       }
       const model = settings.model.trim() || "gpt-4.1-mini";
-      const responseJson = await this.postJson(buildRequestPayload2(targets, language, model, glossary), apiKey);
+      const responseJson = await this.postJson(buildRequestPayload(targets, language, model, glossary), apiKey);
       const parsed = parseCleanupResponse(responseJson);
       const mapped = new Map(parsed.corrections.map((item) => [item.id, item]));
       const issues = [];
@@ -962,7 +572,7 @@ ${safeJson(entry.data)}`;
       }
     }
   };
-  function buildRequestPayload2(targets, language, model, glossary) {
+  function buildRequestPayload(targets, language, model, glossary) {
     const languageMode = language === "de" ? "German" : language === "en" ? "English" : "Auto-detect per transcript segment (German or English)";
     const glossaryTerms = glossary.brandTerms.slice(0, 400).map((term) => ({
       term: term.term,
@@ -2411,19 +2021,8 @@ ${safeJson(entry.data)}`;
     await copyFile(context.projectPath, backupPath);
     return backupPath;
   }
-  function clipTrackItemType(ppro) {
-    return ppro?.Constants?.TrackItemType?.CLIP ?? ppro?.Constants?.TrackItemType?.Clip ?? ppro?.constants?.TrackItemType?.CLIP ?? ppro?.constants?.TrackItemType?.Clip ?? 1;
-  }
   function readString(value) {
     return typeof value === "string" && value.length > 0 ? value : void 0;
-  }
-  async function tryCall(label, fn, logger) {
-    try {
-      return await fn();
-    } catch (error) {
-      logger.debug(`${label} failed.`, stringifyError(error));
-      return void 0;
-    }
   }
   function stringifyError(error) {
     if (error instanceof Error) {
@@ -2433,205 +2032,6 @@ ${safeJson(entry.data)}`;
   }
 
   // src/premiere/nativeScanner.ts
-  var captionAccessors = ["getText", "getCaptionText", "getTextContent", "getContent", "getValue"];
-  var captionMutators = ["createSetTextAction", "createSetCaptionTextAction", "setText", "setCaptionText"];
-  var NativePremiereScanner = class {
-    constructor(logger) {
-      this.logger = logger;
-    }
-    async scan() {
-      const context = await getPremiereContext(this.logger);
-      const targets = [];
-      if (!context.sequence) {
-        return { context, targets };
-      }
-      await this.scanCaptionTracks(context, targets);
-      await this.scanGraphicText(context, targets);
-      if (context.capability.captionTracks === "available" && context.capability.captionTextRead !== "available") {
-        context.capability.notes.push(
-          "Caption tracks are present, but public caption text access is not available in this Premiere UXP build."
-        );
-      }
-      return { context, targets };
-    }
-    async scanCaptionTracks(context, targets) {
-      const { sequence, ppro, capability } = context;
-      const count = await tryCall("sequence.getCaptionTrackCount()", () => sequence.getCaptionTrackCount(), this.logger);
-      if (typeof count !== "number" || count <= 0) {
-        capability.captionTracks = typeof count === "number" ? "unavailable" : "unknown";
-        capability.captionTextRead = "unavailable";
-        capability.captionTextWrite = "unavailable";
-        return;
-      }
-      capability.captionTracks = "available";
-      const clipType = clipTrackItemType(ppro);
-      let readAnyText = false;
-      let writeAnyText = false;
-      for (let trackIndex = 0; trackIndex < count; trackIndex += 1) {
-        const track = await tryCall(`sequence.getCaptionTrack(${trackIndex})`, () => sequence.getCaptionTrack(trackIndex), this.logger);
-        const items = await tryCall(
-          `captionTrack.getTrackItems(${trackIndex})`,
-          () => track?.getTrackItems(clipType, false),
-          this.logger
-        );
-        if (!Array.isArray(items)) {
-          continue;
-        }
-        for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
-          const item = items[itemIndex];
-          const textInfo = await readCaptionText(item, this.logger);
-          if (!textInfo || !looksLikeHumanText(textInfo.text)) {
-            continue;
-          }
-          readAnyText = true;
-          const mutator = captionMutators.find((method) => typeof item?.[method] === "function");
-          writeAnyText = writeAnyText || Boolean(mutator);
-          targets.push({
-            id: `caption:${trackIndex}:${itemIndex}`,
-            source: "native-caption",
-            label: `Caption track ${trackIndex + 1}, item ${itemIndex + 1}`,
-            sequenceName: context.sequenceName,
-            trackType: "caption",
-            trackIndex,
-            itemIndex,
-            originalText: textInfo.text,
-            confidence: mutator ? "high" : "medium",
-            native: {
-              kind: "caption-method",
-              trackItem: item,
-              accessor: textInfo.accessor,
-              mutator
-            }
-          });
-        }
-      }
-      capability.captionTextRead = readAnyText ? "available" : "unavailable";
-      capability.captionTextWrite = writeAnyText ? "available" : "unavailable";
-    }
-    async scanGraphicText(context, targets) {
-      const { sequence, ppro, capability } = context;
-      const count = await tryCall("sequence.getVideoTrackCount()", () => sequence.getVideoTrackCount(), this.logger);
-      if (typeof count !== "number" || count <= 0) {
-        capability.graphicTextRead = "unavailable";
-        capability.graphicTextWrite = "unavailable";
-        return;
-      }
-      const clipType = clipTrackItemType(ppro);
-      let readAnyText = false;
-      let writeAnyText = false;
-      for (let trackIndex = 0; trackIndex < count; trackIndex += 1) {
-        const track = await tryCall(`sequence.getVideoTrack(${trackIndex})`, () => sequence.getVideoTrack(trackIndex), this.logger);
-        const items = await tryCall(
-          `videoTrack.getTrackItems(${trackIndex})`,
-          () => track?.getTrackItems(clipType, false),
-          this.logger
-        );
-        if (!Array.isArray(items)) {
-          continue;
-        }
-        for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
-          const item = items[itemIndex];
-          const itemName = await tryCall("trackItem.getName()", () => item?.getName(), this.logger);
-          const startTime = await tryCall("trackItem.getStartTime()", () => item?.getStartTime(), this.logger);
-          const endTime = await tryCall("trackItem.getEndTime()", () => item?.getEndTime(), this.logger);
-          const chain = await tryCall("trackItem.getComponentChain()", () => item?.getComponentChain(), this.logger);
-          const componentCount = await tryCall("componentChain.getComponentCount()", () => chain?.getComponentCount(), this.logger);
-          if (typeof componentCount !== "number") {
-            continue;
-          }
-          for (let componentIndex = 0; componentIndex < componentCount; componentIndex += 1) {
-            const component = await tryCall(
-              `componentChain.getComponentAtIndex(${componentIndex})`,
-              () => chain.getComponentAtIndex(componentIndex),
-              this.logger
-            );
-            const componentName = await componentLabel(component, this.logger);
-            const paramCount = await tryCall("component.getParamCount()", () => component?.getParamCount(), this.logger);
-            if (typeof paramCount !== "number") {
-              continue;
-            }
-            for (let paramIndex = 0; paramIndex < paramCount; paramIndex += 1) {
-              const param = await tryCall(`component.getParam(${paramIndex})`, () => component.getParam(paramIndex), this.logger);
-              const paramName = typeof param?.displayName === "string" ? param.displayName : `Param ${paramIndex + 1}`;
-              const value = await readParamString(param, startTime, this.logger);
-              if (!value || !looksLikeHumanText(value) || !isLikelyTextParam(paramName, componentName, value)) {
-                continue;
-              }
-              readAnyText = true;
-              const writable = typeof param?.createKeyframe === "function" && typeof param?.createSetValueAction === "function";
-              writeAnyText = writeAnyText || writable;
-              targets.push({
-                id: `graphic:${trackIndex}:${itemIndex}:${componentIndex}:${paramIndex}`,
-                source: "graphic-text",
-                label: `${itemName || "Graphic"} \xB7 ${componentName} \xB7 ${paramName}`,
-                sequenceName: context.sequenceName,
-                trackType: "video",
-                trackIndex,
-                itemIndex,
-                componentIndex,
-                paramIndex,
-                startTicks: tickString(startTime),
-                endTicks: tickString(endTime),
-                originalText: value,
-                confidence: writable ? "high" : "medium",
-                native: {
-                  kind: "component-param",
-                  trackItem: item,
-                  component,
-                  param,
-                  startTime
-                }
-              });
-            }
-          }
-        }
-      }
-      capability.graphicTextRead = readAnyText ? "available" : "unavailable";
-      capability.graphicTextWrite = writeAnyText ? "available" : "unavailable";
-    }
-  };
-  async function readCaptionText(item, logger) {
-    for (const accessor of captionAccessors) {
-      if (typeof item?.[accessor] !== "function") {
-        continue;
-      }
-      const value = await tryCall(`captionItem.${accessor}()`, () => item[accessor](), logger);
-      if (typeof value === "string") {
-        return { accessor, text: value };
-      }
-    }
-    if (typeof item?.text === "string") {
-      return { accessor: "text", text: item.text };
-    }
-    return void 0;
-  }
-  async function readParamString(param, time, logger) {
-    if (param && time && typeof param.getValueAtTime === "function") {
-      const value = await tryCall("param.getValueAtTime()", () => param.getValueAtTime(time), logger);
-      if (typeof value === "string") {
-        return value;
-      }
-    }
-    if (typeof param?.getStartValue === "function") {
-      const keyframe = await tryCall("param.getStartValue()", () => param.getStartValue(), logger);
-      if (typeof keyframe?.value === "string") {
-        return keyframe.value;
-      }
-    }
-    return void 0;
-  }
-  async function componentLabel(component, logger) {
-    const displayName = await tryCall("component.getDisplayName()", () => component?.getDisplayName(), logger);
-    if (typeof displayName === "string" && displayName) {
-      return displayName;
-    }
-    const matchName = await tryCall("component.getMatchName()", () => component?.getMatchName(), logger);
-    return typeof matchName === "string" && matchName ? matchName : "Component";
-  }
-  function isLikelyTextParam(paramName, componentName, value) {
-    const haystack = `${paramName} ${componentName}`.toLowerCase();
-    return haystack.includes("text") || haystack.includes("caption") || haystack.includes("graphic") || value.split(/\s+/).length >= 2;
-  }
   function looksLikeHumanText(value) {
     const text = value.trim();
     if (text.length < 2 || text.length > 5e3) {
@@ -2644,15 +2044,6 @@ ${safeJson(entry.data)}`;
       return false;
     }
     return true;
-  }
-  function tickString(value) {
-    if (!value) {
-      return void 0;
-    }
-    if (typeof value.ticks === "string" || typeof value.ticks === "number") {
-      return String(value.ticks);
-    }
-    return String(value);
   }
 
   // src/premiere/projectFileFallback.ts
@@ -2681,7 +2072,7 @@ ${safeJson(entry.data)}`;
         candidates: candidates.length
       });
       if (base64Scan.transcriptOnlyCandidates > 0 && base64Scan.captionCandidates.length === 0) {
-        this.logger.warn("Project file contains transcript text, but no writable caption text blocks were found.", {
+        this.logger.warn("Project file contains transcript text, but no writable transcript text blocks were found.", {
           transcriptOnlyCandidates: base64Scan.transcriptOnlyCandidates
         });
       }
@@ -2732,7 +2123,7 @@ ${safeJson(entry.data)}`;
         }
         const currentProjectTarget = refreshProjectTarget(projectXml.xml, projectPath, projectXml.compression, projectTarget);
         if (currentProjectTarget.decodedOriginal !== projectTarget.decodedOriginal) {
-          throw new Error(`Caption text changed after scan for ${target.label}. Run Check Subtitles again before applying.`);
+          throw new Error(`Transcript text changed after scan for ${target.label}. Run Check Transcript again before applying.`);
         }
         if (currentProjectTarget !== projectTarget) {
           this.logger.info("Refreshed project-file target before write.", {
@@ -3356,7 +2747,7 @@ ${safeJson(entry.data)}`;
           for (const action of actions) {
             compoundAction.addAction(action);
           }
-        }, "Subtitle QA: Apply accepted subtitle fixes");
+        }, "Subtitle QA: Apply accepted transcript fixes");
       }
       return issues.length;
     }
@@ -4112,11 +3503,9 @@ ${safeJson(entry.data)}`;
       this.root = root;
       this.logger = new Logger();
       this.fs = new UxpFileSystem(this.logger);
-      this.nativeScanner = new NativePremiereScanner(this.logger);
       this.fallback = new ProjectFileFallback(this.fs, this.logger);
       this.transcriptApi = new TranscriptApiBridge(this.logger);
       this.mockEngine = new MockCorrectionEngine();
-      this.openAiSpelling = new OpenAiSpellingEngine();
       this.openAiTranscriptCleanup = new OpenAiTranscriptCleanupEngine();
       this.applier = new FixApplier(this.fs, this.fallback, this.transcriptApi, this.logger);
       this.glossary = defaultGlossary;
@@ -4141,9 +3530,7 @@ ${safeJson(entry.data)}`;
     }
     bindEvents() {
       this.cleanTranscriptButton.addEventListener("click", () => this.cleanTranscript());
-      this.checkButton.addEventListener("click", () => this.checkSubtitles());
       this.emptyTranscriptButton.addEventListener("click", () => this.cleanTranscript());
-      this.emptyCheckButton.addEventListener("click", () => this.checkSubtitles());
       this.acceptAllButton.addEventListener("click", () => this.setAll("accepted"));
       this.rejectAllButton.addEventListener("click", () => this.setAll("rejected"));
       this.applyButton.addEventListener("click", () => this.applyAccepted());
@@ -4165,40 +3552,34 @@ ${safeJson(entry.data)}`;
       this.issuesTab.addEventListener("click", () => this.showTab("issues"));
       this.debugTab.addEventListener("click", () => this.showTab("debug"));
     }
-    async checkSubtitles() {
-      await this.runScan("subtitle");
-    }
     async cleanTranscript() {
-      await this.runScan("transcript");
+      await this.runTranscriptCheck();
     }
-    async runScan(workflow) {
-      this.setBusy(true, workflow === "transcript" ? "Scanning transcript for cleanup..." : "Scanning active Premiere sequence...");
+    async runTranscriptCheck() {
+      this.setBusy(true, "Checking transcript with OpenAI...");
       this.logger.clear();
       this.reviewedDisplayKeys.clear();
       this.scanRunKey = createScanRunKey();
       try {
-        const nativeScan = await this.nativeScanner.scan();
-        this.context = nativeScan.context;
-        const targets = workflow === "transcript" ? await this.loadTranscriptTargets(nativeScan.context) : await this.loadSubtitleTargets(nativeScan);
-        const issues = await this.checkIssues(targets, workflow);
+        const context = await getPremiereContext(this.logger);
+        this.context = context;
+        const targets = await this.loadTranscriptTargets(context);
+        const issues = await this.checkIssues(targets);
         this.scanResult = {
-          projectName: nativeScan.context.projectName,
-          projectPath: nativeScan.context.projectPath,
-          sequenceName: nativeScan.context.sequenceName,
-          capability: nativeScan.context.capability,
+          projectName: context.projectName,
+          projectPath: context.projectPath,
+          sequenceName: context.sequenceName,
+          capability: context.capability,
           targets,
           issues
         };
         if (targets.length === 0) {
-          this.statusText.textContent = workflow === "transcript" ? "Transcript cleanup unsupported in this project format. Open Debug for details." : "Caption format unsupported. Open Debug for capability details.";
-          this.logger.warn(
-            workflow === "transcript" ? "Transcript cleanup unsupported." : "Caption format unsupported.",
-            nativeScan.context.capability
-          );
+          this.statusText.textContent = "Transcript cleanup unsupported in this project format. Open Debug for details.";
+          this.logger.warn("Transcript cleanup unsupported.", context.capability);
         } else {
           const writableIssues = issues.filter((issue) => isWritableIssue(issue)).length;
           const reviewOnlyIssues = issues.length - writableIssues;
-          this.statusText.textContent = `Found ${issues.length} issue${issues.length === 1 ? "" : "s"} in ${targets.length} text item${targets.length === 1 ? "" : "s"} (${languageLabel(this.scanLanguage)} / ${spellingModeLabel(this.workflowEngineMode(workflow))})${reviewOnlyIssues > 0 ? `, ${writableIssues} writable` : ""}.`;
+          this.statusText.textContent = `Found ${issues.length} issue${issues.length === 1 ? "" : "s"} in ${targets.length} text item${targets.length === 1 ? "" : "s"} (${languageLabel(this.scanLanguage)} / OpenAI Transcript)${reviewOnlyIssues > 0 ? `, ${writableIssues} writable` : ""}.`;
         }
       } catch (error) {
         this.statusText.textContent = "Scan failed. Open Debug for details.";
@@ -4207,32 +3588,6 @@ ${safeJson(entry.data)}`;
         this.setBusy(false);
         this.render();
       }
-    }
-    async loadSubtitleTargets(nativeScan) {
-      const targets = [...nativeScan.targets];
-      const shouldTryProjectFile = nativeScan.context.projectPath && nativeScan.context.capability.captionTracks !== "unavailable" && nativeScan.context.capability.captionTextRead !== "available";
-      if (shouldTryProjectFile && nativeScan.context.projectPath) {
-        this.logger.info("Native caption text is not accessible; trying project-file fallback.");
-        try {
-          if (typeof nativeScan.context.project?.save === "function") {
-            this.logger.info("Saving active project before project-file fallback scan.");
-            await nativeScan.context.project.save();
-          }
-          const fallbackTargets = await this.fallback.scan(nativeScan.context.projectPath, nativeScan.context.sequenceName);
-          targets.push(...fallbackTargets);
-          nativeScan.context.capability.projectFileFallback = fallbackTargets.length > 0 ? "available" : "unavailable";
-          if (fallbackTargets.length === 0) {
-            nativeScan.context.capability.notes.push("Project-file fallback did not find caption or graphic text candidates in the active project.");
-          }
-        } catch (error) {
-          nativeScan.context.capability.projectFileFallback = "unavailable";
-          nativeScan.context.capability.notes.push(error instanceof Error ? error.message : String(error));
-          this.logger.warn("Project-file fallback scan failed.", serializeError(error));
-        }
-      } else {
-        nativeScan.context.capability.projectFileFallback = targets.some((target) => target.source === "project-file") ? "available" : "not-needed";
-      }
-      return targets;
     }
     async loadTranscriptTargets(context) {
       if (!context.projectPath) {
@@ -4280,15 +3635,9 @@ ${safeJson(entry.data)}`;
         } catch (error) {
           this.logger.warn("Project-file transcript fallback scan failed.", serializeError(error));
         }
-        context.capability.notes.push("Project-file transcript scan did not find writable transcript blocks.");
-        this.logger.warn("TranscriptData not writable in this project; falling back to caption text blocks.");
-        const captionTargets = await this.fallback.scan(context.projectPath, context.sequenceName);
-        if (captionTargets.length > 0) {
-          context.capability.projectFileFallback = "available";
-          context.capability.notes.push("Used caption text blocks as transcript-cleanup fallback.");
-          return captionTargets;
-        }
         context.capability.projectFileFallback = "unavailable";
+        context.capability.notes.push("Project-file transcript scan did not find writable transcript blocks.");
+        this.logger.warn("TranscriptData not writable in this project; subtitle/caption fallback is disabled in transcript-only mode.");
         return [];
       } catch (error) {
         context.capability.projectFileFallback = "unavailable";
@@ -4598,79 +3947,30 @@ ${safeJson(entry.data)}`;
         this.logger.info("Updated scan language mode.", { language: this.scanLanguage });
       }
     }
-    async checkIssues(targets, workflow) {
+    async checkIssues(targets) {
       const localIssues = dedupeIssues(this.mockEngine.checkTargets(targets, this.glossary, this.scanLanguage));
-      if (workflow === "transcript") {
-        try {
-          const cleanupIssues = dedupeIssues(
-            await this.openAiTranscriptCleanup.cleanTargets(targets, this.scanLanguage, this.openAiSettings, this.glossary)
-          );
-          this.logger.info("OpenAI full transcript cleanup complete.", {
-            mode: "openai_full_transcript",
-            targets: targets.length,
-            cleanupIssues: cleanupIssues.length
-          });
-          return cleanupIssues;
-        } catch (error) {
-          this.logger.warn("OpenAI full transcript cleanup failed; using local fallback.", serializeError(error));
-          this.statusText.textContent = "OpenAI transcript cleanup failed; used local fallback.";
-          return localIssues;
-        }
-      }
-      const mode = this.workflowEngineMode(workflow);
-      if (mode === "local") {
-        return localIssues;
-      }
       try {
-        const remoteIssues = dedupeIssues(
-          await this.openAiSpelling.checkTargetsWithGlossary(targets, this.scanLanguage, {
-            ...this.openAiSettings,
-            mode
-          }, this.glossary)
+        const cleanupIssues = dedupeIssues(
+          await this.openAiTranscriptCleanup.cleanTargets(targets, this.scanLanguage, this.openAiSettings, this.glossary)
         );
-        if (mode === "openai_full") {
-          const localFallbackIssues = selectLocalFallbackIssues(localIssues);
-          const remoteRanges = new Set(
-            remoteIssues.map((issue) => `${issue.targetId}:${issue.replacement.start}:${issue.replacement.end}`)
-          );
-          const localNonOverlapping = localFallbackIssues.filter(
-            (issue) => !remoteRanges.has(`${issue.targetId}:${issue.replacement.start}:${issue.replacement.end}`)
-          );
-          const merged2 = dedupeIssues([...remoteIssues, ...localNonOverlapping]);
-          this.logger.info("OpenAI full sentence QA complete.", {
-            mode,
-            localFallbackIssues: localFallbackIssues.length,
-            remoteIssues: remoteIssues.length,
-            mergedIssues: merged2.length
-          });
-          return merged2;
-        }
-        const localNonSpelling = localIssues.filter((issue) => issue.type !== "spelling");
-        const merged = dedupeIssues([...localNonSpelling, ...remoteIssues]);
-        this.logger.info("OpenAI spelling check complete.", {
-          mode: "openai",
-          localSpelling: localIssues.filter((issue) => issue.type === "spelling").length,
-          remoteSpelling: remoteIssues.length
+        this.logger.info("OpenAI full transcript cleanup complete.", {
+          mode: "openai_full_transcript",
+          targets: targets.length,
+          cleanupIssues: cleanupIssues.length
         });
-        return merged;
+        return cleanupIssues;
       } catch (error) {
-        this.logger.warn("OpenAI QA failed; using local fallback.", serializeError(error));
-        this.statusText.textContent = "OpenAI QA failed; used local fallback.";
+        this.logger.warn("OpenAI full transcript cleanup failed; using local fallback.", serializeError(error));
+        this.statusText.textContent = "OpenAI transcript cleanup failed; used local fallback.";
         return localIssues;
       }
-    }
-    workflowEngineMode(workflow) {
-      if (workflow === "transcript") {
-        return "openai_full";
-      }
-      return this.openAiSettings.mode;
     }
     onSpellingModeChanged() {
       const selected = this.spellingEngineMode.value;
       if (selected === "local" || selected === "openai" || selected === "openai_full") {
         this.openAiSettings.mode = selected;
         this.toggleOpenAiInputs(selected !== "local");
-        this.statusText.textContent = `Spelling engine set to ${spellingModeLabel(selected)}. Save to persist.`;
+        this.statusText.textContent = `Transcript engine set to ${spellingModeLabel(selected)}. Save to persist.`;
       }
     }
     async loadEngineSettings() {
@@ -4683,7 +3983,7 @@ ${safeJson(entry.data)}`;
         this.openAiSettings = parsed;
         this.hydrateEngineSettingsUi();
         this.toggleOpenAiInputs(this.openAiSettings.mode !== "local");
-        this.logger.info("Loaded spelling engine settings.", {
+        this.logger.info("Loaded transcript engine settings.", {
           mode: this.openAiSettings.mode,
           model: this.openAiSettings.model,
           location: loaded.location ?? "plugin-data"
@@ -4692,30 +3992,29 @@ ${safeJson(entry.data)}`;
         this.openAiSettings = defaults;
         this.hydrateEngineSettingsUi();
         this.toggleOpenAiInputs(false);
-        this.logger.warn("Could not load spelling engine settings; using defaults.", serializeError(error));
+        this.logger.warn("Could not load transcript engine settings; using defaults.", serializeError(error));
       }
     }
     async saveOpenAiSettings() {
       try {
-        const modeValue = this.spellingEngineMode.value;
         this.openAiSettings = {
-          mode: modeValue === "openai_full" ? "openai_full" : modeValue === "openai" ? "openai" : "local",
+          mode: "openai_full",
           apiKey: this.openAiApiKey.value.trim(),
           model: this.openAiModel.value.trim() || "gpt-4.1-mini"
         };
         const text = `${JSON.stringify(this.openAiSettings, null, 2)}
 `;
         const saved = await this.fs.saveEngineSettings(text);
-        this.statusText.textContent = `Saved spelling engine settings (${spellingModeLabel(this.openAiSettings.mode)}).`;
-        this.logger.info("Saved spelling engine settings.", {
+        this.statusText.textContent = `Saved transcript engine settings (${spellingModeLabel(this.openAiSettings.mode)}).`;
+        this.logger.info("Saved transcript engine settings.", {
           mode: this.openAiSettings.mode,
           model: this.openAiSettings.model,
           location: saved.location ?? "plugin-data"
         });
         this.setEngineSettingsPanelVisible(false);
       } catch (error) {
-        this.statusText.textContent = "Could not save spelling engine settings. Open Debug for details.";
-        this.logger.error("Saving spelling engine settings failed.", serializeError(error));
+        this.statusText.textContent = "Could not save transcript engine settings. Open Debug for details.";
+        this.logger.error("Saving transcript engine settings failed.", serializeError(error));
       }
     }
     toggleEngineSettings() {
@@ -4903,7 +4202,7 @@ ${safeJson(entry.data)}`;
         return;
       }
       if (!this.scanResult || allIssues.length === 0) {
-        message.textContent = "Start with Clean Transcript (OpenAI), then use Check Subtitles as a fallback pass.";
+        message.textContent = "Run Check Transcript (OpenAI), review the suggested cleanup, then apply accepted fixes.";
       } else if (visibleIssues.length === 0 && reviewedIssues.length > 0) {
         message.textContent = "All pending issues are reviewed. Adjust decisions below or apply accepted fixes.";
       } else {
@@ -4912,9 +4211,7 @@ ${safeJson(entry.data)}`;
     }
     setBusy(isBusy, message) {
       this.cleanTranscriptButton.disabled = isBusy;
-      this.checkButton.disabled = isBusy;
       this.emptyTranscriptButton.disabled = isBusy;
-      this.emptyCheckButton.disabled = isBusy;
       this.loadGlossaryButton.disabled = isBusy;
       this.glossaryAddButton.disabled = isBusy;
       this.glossarySaveButton.disabled = isBusy;
@@ -4945,14 +4242,8 @@ ${safeJson(entry.data)}`;
         }))
       });
     }
-    get checkButton() {
-      return getElement(this.root, "checkButton");
-    }
     get cleanTranscriptButton() {
       return getElement(this.root, "cleanTranscriptButton");
-    }
-    get emptyCheckButton() {
-      return getElement(this.root, "emptyCheckButton");
     }
     get emptyTranscriptButton() {
       return getElement(this.root, "emptyTranscriptButton");
@@ -5168,25 +4459,24 @@ ${safeJson(entry.data)}`;
   }
   function spellingModeLabel(mode) {
     if (mode === "openai_full") {
-      return "OpenAI Full QA";
+      return "OpenAI Transcript";
     }
     if (mode === "openai") {
-      return "OpenAI Spelling";
+      return "OpenAI Transcript";
     }
-    return "Local";
+    return "OpenAI Transcript";
   }
   function defaultOpenAiSpellingSettings() {
     return {
-      mode: "local",
+      mode: "openai_full",
       apiKey: "",
       model: "gpt-4.1-mini"
     };
   }
   function parseOpenAiSpellingSettings(raw, fallback) {
     const parsed = JSON.parse(raw);
-    const mode = parsed.mode === "openai_full" ? "openai_full" : parsed.mode === "openai" ? "openai" : "local";
     return {
-      mode,
+      mode: "openai_full",
       apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : fallback.apiKey,
       model: typeof parsed.model === "string" && parsed.model.trim().length > 0 ? parsed.model : fallback.model
     };
@@ -5220,17 +4510,6 @@ ${safeJson(entry.data)}`;
       }
     }
     return result;
-  }
-  function selectLocalFallbackIssues(issues) {
-    return issues.filter((issue) => {
-      if (issue.type === "glossary") {
-        return true;
-      }
-      if (issue.type === "punctuation" && issue.ruleId === "punctuation-terminal-mark") {
-        return false;
-      }
-      return true;
-    });
   }
   function projectIssueScope(issue) {
     const projectFile = issue.target.projectFile;

@@ -2,13 +2,11 @@ import type { Glossary, Issue, IssueStatus, OpenAiSpellingSettings, ScanLanguage
 import { Logger } from "../domain/logger";
 import { defaultGlossary, parseGlossaryJson } from "../domain/glossary";
 import { MockCorrectionEngine } from "../domain/mockCorrectionEngine";
-import { OpenAiSpellingEngine } from "../domain/openAiSpellingEngine";
 import { FULL_TRANSCRIPT_REWRITE_RULE_ID, OpenAiTranscriptCleanupEngine } from "../domain/openAiTranscriptCleanupEngine";
 import { UxpFileSystem } from "../platform/fileSystem";
-import { NativePremiereScanner } from "../premiere/nativeScanner";
 import { ProjectFileFallback } from "../premiere/projectFileFallback";
 import { FixApplier } from "../premiere/applyFixes";
-import type { PremiereContext } from "../premiere/premiereContext";
+import { getPremiereContext, type PremiereContext } from "../premiere/premiereContext";
 import { TranscriptApiBridge } from "../premiere/transcriptApi";
 import { encodeUtf8 } from "../platform/utf8";
 import { applyReplacement } from "../domain/textEdits";
@@ -24,11 +22,9 @@ const CENTRAL_GLOSSARY_SHAREPOINT_URL =
 export class SubtitleQAPanel {
   private readonly logger = new Logger();
   private readonly fs = new UxpFileSystem(this.logger);
-  private readonly nativeScanner = new NativePremiereScanner(this.logger);
   private readonly fallback = new ProjectFileFallback(this.fs, this.logger);
   private readonly transcriptApi = new TranscriptApiBridge(this.logger);
   private readonly mockEngine = new MockCorrectionEngine();
-  private readonly openAiSpelling = new OpenAiSpellingEngine();
   private readonly openAiTranscriptCleanup = new OpenAiTranscriptCleanupEngine();
   private readonly applier = new FixApplier(this.fs, this.fallback, this.transcriptApi, this.logger);
 
@@ -59,9 +55,7 @@ export class SubtitleQAPanel {
 
   private bindEvents(): void {
     this.cleanTranscriptButton.addEventListener("click", () => this.cleanTranscript());
-    this.checkButton.addEventListener("click", () => this.checkSubtitles());
     this.emptyTranscriptButton.addEventListener("click", () => this.cleanTranscript());
-    this.emptyCheckButton.addEventListener("click", () => this.checkSubtitles());
     this.acceptAllButton.addEventListener("click", () => this.setAll("accepted"));
     this.rejectAllButton.addEventListener("click", () => this.setAll("rejected"));
     this.applyButton.addEventListener("click", () => this.applyAccepted());
@@ -84,50 +78,39 @@ export class SubtitleQAPanel {
     this.debugTab.addEventListener("click", () => this.showTab("debug"));
   }
 
-  private async checkSubtitles(): Promise<void> {
-    await this.runScan("subtitle");
-  }
-
   private async cleanTranscript(): Promise<void> {
-    await this.runScan("transcript");
+    await this.runTranscriptCheck();
   }
 
-  private async runScan(workflow: "subtitle" | "transcript"): Promise<void> {
-    this.setBusy(true, workflow === "transcript" ? "Scanning transcript for cleanup..." : "Scanning active Premiere sequence...");
+  private async runTranscriptCheck(): Promise<void> {
+    this.setBusy(true, "Checking transcript with OpenAI...");
     this.logger.clear();
     this.reviewedDisplayKeys.clear();
     this.scanRunKey = createScanRunKey();
 
     try {
-      const nativeScan = await this.nativeScanner.scan();
-      this.context = nativeScan.context;
-      const targets =
-        workflow === "transcript" ? await this.loadTranscriptTargets(nativeScan.context) : await this.loadSubtitleTargets(nativeScan);
-      const issues = await this.checkIssues(targets, workflow);
+      const context = await getPremiereContext(this.logger);
+      this.context = context;
+      const targets = await this.loadTranscriptTargets(context);
+      const issues = await this.checkIssues(targets);
       this.scanResult = {
-        projectName: nativeScan.context.projectName,
-        projectPath: nativeScan.context.projectPath,
-        sequenceName: nativeScan.context.sequenceName,
-        capability: nativeScan.context.capability,
+        projectName: context.projectName,
+        projectPath: context.projectPath,
+        sequenceName: context.sequenceName,
+        capability: context.capability,
         targets,
         issues
       };
 
       if (targets.length === 0) {
-        this.statusText.textContent =
-          workflow === "transcript"
-            ? "Transcript cleanup unsupported in this project format. Open Debug for details."
-            : "Caption format unsupported. Open Debug for capability details.";
-        this.logger.warn(
-          workflow === "transcript" ? "Transcript cleanup unsupported." : "Caption format unsupported.",
-          nativeScan.context.capability
-        );
+        this.statusText.textContent = "Transcript cleanup unsupported in this project format. Open Debug for details.";
+        this.logger.warn("Transcript cleanup unsupported.", context.capability);
       } else {
         const writableIssues = issues.filter((issue) => isWritableIssue(issue)).length;
         const reviewOnlyIssues = issues.length - writableIssues;
         this.statusText.textContent = `Found ${issues.length} issue${issues.length === 1 ? "" : "s"} in ${targets.length} text item${
           targets.length === 1 ? "" : "s"
-        } (${languageLabel(this.scanLanguage)} / ${spellingModeLabel(this.workflowEngineMode(workflow))})${
+        } (${languageLabel(this.scanLanguage)} / OpenAI Transcript)${
           reviewOnlyIssues > 0 ? `, ${writableIssues} writable` : ""
         }.`;
       }
@@ -138,40 +121,6 @@ export class SubtitleQAPanel {
       this.setBusy(false);
       this.render();
     }
-  }
-
-  private async loadSubtitleTargets(nativeScan: { context: PremiereContext; targets: Issue["target"][] }): Promise<Issue["target"][]> {
-    const targets = [...nativeScan.targets];
-    const shouldTryProjectFile =
-      nativeScan.context.projectPath &&
-      nativeScan.context.capability.captionTracks !== "unavailable" &&
-      nativeScan.context.capability.captionTextRead !== "available";
-
-    if (shouldTryProjectFile && nativeScan.context.projectPath) {
-      this.logger.info("Native caption text is not accessible; trying project-file fallback.");
-      try {
-        if (typeof nativeScan.context.project?.save === "function") {
-          this.logger.info("Saving active project before project-file fallback scan.");
-          await nativeScan.context.project.save();
-        }
-        const fallbackTargets = await this.fallback.scan(nativeScan.context.projectPath, nativeScan.context.sequenceName);
-        targets.push(...fallbackTargets);
-        nativeScan.context.capability.projectFileFallback = fallbackTargets.length > 0 ? "available" : "unavailable";
-        if (fallbackTargets.length === 0) {
-          nativeScan.context.capability.notes.push("Project-file fallback did not find caption or graphic text candidates in the active project.");
-        }
-      } catch (error) {
-        nativeScan.context.capability.projectFileFallback = "unavailable";
-        nativeScan.context.capability.notes.push(error instanceof Error ? error.message : String(error));
-        this.logger.warn("Project-file fallback scan failed.", serializeError(error));
-      }
-    } else {
-      nativeScan.context.capability.projectFileFallback = targets.some((target) => target.source === "project-file")
-        ? "available"
-        : "not-needed";
-    }
-
-    return targets;
   }
 
   private async loadTranscriptTargets(context: PremiereContext): Promise<Issue["target"][]> {
@@ -227,16 +176,9 @@ export class SubtitleQAPanel {
         this.logger.warn("Project-file transcript fallback scan failed.", serializeError(error));
       }
 
-      context.capability.notes.push("Project-file transcript scan did not find writable transcript blocks.");
-      this.logger.warn("TranscriptData not writable in this project; falling back to caption text blocks.");
-      const captionTargets = await this.fallback.scan(context.projectPath, context.sequenceName);
-      if (captionTargets.length > 0) {
-        context.capability.projectFileFallback = "available";
-        context.capability.notes.push("Used caption text blocks as transcript-cleanup fallback.");
-        return captionTargets;
-      }
-
       context.capability.projectFileFallback = "unavailable";
+      context.capability.notes.push("Project-file transcript scan did not find writable transcript blocks.");
+      this.logger.warn("TranscriptData not writable in this project; subtitle/caption fallback is disabled in transcript-only mode.");
       return [];
     } catch (error) {
       context.capability.projectFileFallback = "unavailable";
@@ -596,76 +538,23 @@ export class SubtitleQAPanel {
     }
   }
 
-  private async checkIssues(targets: Issue["target"][], workflow: "subtitle" | "transcript"): Promise<Issue[]> {
+  private async checkIssues(targets: Issue["target"][]): Promise<Issue[]> {
     const localIssues = dedupeIssues(this.mockEngine.checkTargets(targets, this.glossary, this.scanLanguage));
-    if (workflow === "transcript") {
-      try {
-        const cleanupIssues = dedupeIssues(
-          await this.openAiTranscriptCleanup.cleanTargets(targets, this.scanLanguage, this.openAiSettings, this.glossary)
-        );
-        this.logger.info("OpenAI full transcript cleanup complete.", {
-          mode: "openai_full_transcript",
-          targets: targets.length,
-          cleanupIssues: cleanupIssues.length
-        });
-        return cleanupIssues;
-      } catch (error) {
-        this.logger.warn("OpenAI full transcript cleanup failed; using local fallback.", serializeError(error));
-        this.statusText.textContent = "OpenAI transcript cleanup failed; used local fallback.";
-        return localIssues;
-      }
-    }
-
-    const mode = this.workflowEngineMode(workflow);
-    if (mode === "local") {
-      return localIssues;
-    }
-
     try {
-      const remoteIssues = dedupeIssues(
-        await this.openAiSpelling.checkTargetsWithGlossary(targets, this.scanLanguage, {
-          ...this.openAiSettings,
-          mode
-        }, this.glossary)
+      const cleanupIssues = dedupeIssues(
+        await this.openAiTranscriptCleanup.cleanTargets(targets, this.scanLanguage, this.openAiSettings, this.glossary)
       );
-      if (mode === "openai_full") {
-        const localFallbackIssues = selectLocalFallbackIssues(localIssues);
-        const remoteRanges = new Set(
-          remoteIssues.map((issue) => `${issue.targetId}:${issue.replacement.start}:${issue.replacement.end}`)
-        );
-        const localNonOverlapping = localFallbackIssues.filter(
-          (issue) => !remoteRanges.has(`${issue.targetId}:${issue.replacement.start}:${issue.replacement.end}`)
-        );
-        const merged = dedupeIssues([...remoteIssues, ...localNonOverlapping]);
-        this.logger.info("OpenAI full sentence QA complete.", {
-          mode,
-          localFallbackIssues: localFallbackIssues.length,
-          remoteIssues: remoteIssues.length,
-          mergedIssues: merged.length
-        });
-        return merged;
-      }
-
-      const localNonSpelling = localIssues.filter((issue) => issue.type !== "spelling");
-      const merged = dedupeIssues([...localNonSpelling, ...remoteIssues]);
-      this.logger.info("OpenAI spelling check complete.", {
-        mode: "openai",
-        localSpelling: localIssues.filter((issue) => issue.type === "spelling").length,
-        remoteSpelling: remoteIssues.length
+      this.logger.info("OpenAI full transcript cleanup complete.", {
+        mode: "openai_full_transcript",
+        targets: targets.length,
+        cleanupIssues: cleanupIssues.length
       });
-      return merged;
+      return cleanupIssues;
     } catch (error) {
-      this.logger.warn("OpenAI QA failed; using local fallback.", serializeError(error));
-      this.statusText.textContent = "OpenAI QA failed; used local fallback.";
+      this.logger.warn("OpenAI full transcript cleanup failed; using local fallback.", serializeError(error));
+      this.statusText.textContent = "OpenAI transcript cleanup failed; used local fallback.";
       return localIssues;
     }
-  }
-
-  private workflowEngineMode(workflow: "subtitle" | "transcript"): SpellingEngineMode {
-    if (workflow === "transcript") {
-      return "openai_full";
-    }
-    return this.openAiSettings.mode;
   }
 
   private onSpellingModeChanged(): void {
@@ -673,7 +562,7 @@ export class SubtitleQAPanel {
     if (selected === "local" || selected === "openai" || selected === "openai_full") {
       this.openAiSettings.mode = selected;
       this.toggleOpenAiInputs(selected !== "local");
-      this.statusText.textContent = `Spelling engine set to ${spellingModeLabel(selected)}. Save to persist.`;
+      this.statusText.textContent = `Transcript engine set to ${spellingModeLabel(selected)}. Save to persist.`;
     }
   }
 
@@ -686,7 +575,7 @@ export class SubtitleQAPanel {
       this.openAiSettings = parsed;
       this.hydrateEngineSettingsUi();
       this.toggleOpenAiInputs(this.openAiSettings.mode !== "local");
-      this.logger.info("Loaded spelling engine settings.", {
+      this.logger.info("Loaded transcript engine settings.", {
         mode: this.openAiSettings.mode,
         model: this.openAiSettings.model,
         location: loaded.location ?? "plugin-data"
@@ -695,30 +584,29 @@ export class SubtitleQAPanel {
       this.openAiSettings = defaults;
       this.hydrateEngineSettingsUi();
       this.toggleOpenAiInputs(false);
-      this.logger.warn("Could not load spelling engine settings; using defaults.", serializeError(error));
+      this.logger.warn("Could not load transcript engine settings; using defaults.", serializeError(error));
     }
   }
 
   private async saveOpenAiSettings(): Promise<void> {
     try {
-      const modeValue = this.spellingEngineMode.value;
       this.openAiSettings = {
-        mode: modeValue === "openai_full" ? "openai_full" : modeValue === "openai" ? "openai" : "local",
+        mode: "openai_full",
         apiKey: this.openAiApiKey.value.trim(),
         model: this.openAiModel.value.trim() || "gpt-4.1-mini"
       };
       const text = `${JSON.stringify(this.openAiSettings, null, 2)}\n`;
       const saved = await this.fs.saveEngineSettings(text);
-      this.statusText.textContent = `Saved spelling engine settings (${spellingModeLabel(this.openAiSettings.mode)}).`;
-      this.logger.info("Saved spelling engine settings.", {
+      this.statusText.textContent = `Saved transcript engine settings (${spellingModeLabel(this.openAiSettings.mode)}).`;
+      this.logger.info("Saved transcript engine settings.", {
         mode: this.openAiSettings.mode,
         model: this.openAiSettings.model,
         location: saved.location ?? "plugin-data"
       });
       this.setEngineSettingsPanelVisible(false);
     } catch (error) {
-      this.statusText.textContent = "Could not save spelling engine settings. Open Debug for details.";
-      this.logger.error("Saving spelling engine settings failed.", serializeError(error));
+      this.statusText.textContent = "Could not save transcript engine settings. Open Debug for details.";
+      this.logger.error("Saving transcript engine settings failed.", serializeError(error));
     }
   }
 
@@ -951,7 +839,7 @@ export class SubtitleQAPanel {
     }
 
     if (!this.scanResult || allIssues.length === 0) {
-      message.textContent = "Start with Clean Transcript (OpenAI), then use Check Subtitles as a fallback pass.";
+      message.textContent = "Run Check Transcript (OpenAI), review the suggested cleanup, then apply accepted fixes.";
     } else if (visibleIssues.length === 0 && reviewedIssues.length > 0) {
       message.textContent = "All pending issues are reviewed. Adjust decisions below or apply accepted fixes.";
     } else {
@@ -961,9 +849,7 @@ export class SubtitleQAPanel {
 
   private setBusy(isBusy: boolean, message?: string): void {
     this.cleanTranscriptButton.disabled = isBusy;
-    this.checkButton.disabled = isBusy;
     this.emptyTranscriptButton.disabled = isBusy;
-    this.emptyCheckButton.disabled = isBusy;
     this.loadGlossaryButton.disabled = isBusy;
     this.glossaryAddButton.disabled = isBusy;
     this.glossarySaveButton.disabled = isBusy;
@@ -997,16 +883,8 @@ export class SubtitleQAPanel {
     });
   }
 
-  private get checkButton(): HTMLButtonElement {
-    return getElement(this.root, "checkButton");
-  }
-
   private get cleanTranscriptButton(): HTMLButtonElement {
     return getElement(this.root, "cleanTranscriptButton");
-  }
-
-  private get emptyCheckButton(): HTMLButtonElement {
-    return getElement(this.root, "emptyCheckButton");
   }
 
   private get emptyTranscriptButton(): HTMLButtonElement {
@@ -1287,17 +1165,17 @@ function languageLabel(language: ScanLanguage): string {
 
 function spellingModeLabel(mode: SpellingEngineMode): string {
   if (mode === "openai_full") {
-    return "OpenAI Full QA";
+    return "OpenAI Transcript";
   }
   if (mode === "openai") {
-    return "OpenAI Spelling";
+    return "OpenAI Transcript";
   }
-  return "Local";
+  return "OpenAI Transcript";
 }
 
 function defaultOpenAiSpellingSettings(): OpenAiSpellingSettings {
   return {
-    mode: "local",
+    mode: "openai_full",
     apiKey: "",
     model: "gpt-4.1-mini"
   };
@@ -1305,9 +1183,8 @@ function defaultOpenAiSpellingSettings(): OpenAiSpellingSettings {
 
 function parseOpenAiSpellingSettings(raw: string, fallback: OpenAiSpellingSettings): OpenAiSpellingSettings {
   const parsed = JSON.parse(raw) as Partial<OpenAiSpellingSettings>;
-  const mode = parsed.mode === "openai_full" ? "openai_full" : parsed.mode === "openai" ? "openai" : "local";
   return {
-    mode,
+    mode: "openai_full",
     apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : fallback.apiKey,
     model: typeof parsed.model === "string" && parsed.model.trim().length > 0 ? parsed.model : fallback.model
   };
@@ -1348,18 +1225,6 @@ function dedupeIssues(issues: Issue[]): Issue[] {
     }
   }
   return result;
-}
-
-function selectLocalFallbackIssues(issues: Issue[]): Issue[] {
-  return issues.filter((issue) => {
-    if (issue.type === "glossary") {
-      return true;
-    }
-    if (issue.type === "punctuation" && issue.ruleId === "punctuation-terminal-mark") {
-      return false;
-    }
-    return true;
-  });
 }
 
 function projectIssueScope(issue: Issue): string {

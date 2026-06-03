@@ -100,7 +100,7 @@ export class FixApplier {
         for (const action of actions) {
           compoundAction.addAction(action);
         }
-      }, "Subtitle QA: Apply accepted subtitle fixes");
+      }, "Subtitle QA: Apply accepted transcript fixes");
     }
 
     return issues.length;

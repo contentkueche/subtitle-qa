@@ -52,7 +52,7 @@ export class ProjectFileFallback {
     });
 
     if (base64Scan.transcriptOnlyCandidates > 0 && base64Scan.captionCandidates.length === 0) {
-      this.logger.warn("Project file contains transcript text, but no writable caption text blocks were found.", {
+      this.logger.warn("Project file contains transcript text, but no writable transcript text blocks were found.", {
         transcriptOnlyCandidates: base64Scan.transcriptOnlyCandidates
       });
     }
@@ -110,7 +110,7 @@ export class ProjectFileFallback {
 
       const currentProjectTarget = refreshProjectTarget(projectXml.xml, projectPath, projectXml.compression, projectTarget);
       if (currentProjectTarget.decodedOriginal !== projectTarget.decodedOriginal) {
-        throw new Error(`Caption text changed after scan for ${target.label}. Run Check Subtitles again before applying.`);
+        throw new Error(`Transcript text changed after scan for ${target.label}. Run Check Transcript again before applying.`);
       }
 
       if (currentProjectTarget !== projectTarget) {

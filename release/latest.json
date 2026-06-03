@@ -1,7 +1,7 @@
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "file": "com.subtitleqa.panel_premierepro.ccx",
   "ccxUrl": "https://raw.githubusercontent.com/contentkueche/subtitle-qa/main/release/com.subtitleqa.panel_premierepro.ccx",
-  "sha256": "53df61a4ec13b05c98e910478c088ea630c502f0386b15146d3942e0dfc5d4aa",
-  "notes": "New architecture: Clean Transcript now uses full-segment OpenAI cleanup and imports rebuilt timed transcript JSON with verification before confirming writes."
+  "sha256": "9a17d0b08fc22e6af466052c5adbb14f44f20c159ad187219bc4d8123bf78246",
+  "notes": "Transcript-only release: removes Check Subtitles and disables caption/graphic scan paths to avoid cutter-machine crashes."
 }

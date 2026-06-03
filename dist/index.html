@@ -10,7 +10,7 @@
       <header class="topbar">
         <div>
           <h1>Subtitle QA</h1>
-          <p>Native subtitle QA inside Premiere Pro.</p>
+          <p>Transcript QA inside Premiere Pro.</p>
         </div>
       </header>
 
@@ -21,15 +21,14 @@
 
       <section id="issuesView" class="view active" aria-live="polite">
         <section class="premiere-body-controls" aria-label="Subtitle QA controls">
-          <p id="statusText">Ready to scan the active Premiere sequence.</p>
+          <p id="statusText">Ready to check the active Premiere transcript.</p>
           <div class="primary-row">
             <select id="languageMode" class="mode-select" aria-label="Language mode">
               <option value="auto" selected>Auto</option>
               <option value="de">German</option>
               <option value="en">English</option>
             </select>
-            <button id="cleanTranscriptButton" class="primary-button" type="button">Clean Transcript (OpenAI)</button>
-            <button id="checkButton" type="button">Check Subtitles</button>
+            <button id="cleanTranscriptButton" class="primary-button" type="button">Check Transcript (OpenAI)</button>
             <button id="loadGlossaryButton" type="button">Glossary</button>
           </div>
           <div class="secondary-row">
@@ -79,10 +78,9 @@
           <div id="glossaryList" class="glossary-list"></div>
         </section>
         <div id="emptyState" class="empty-state">
-          <p>Run a scan to review spelling, grammar, punctuation, and glossary findings.</p>
+          <p>Run a transcript check to review spelling, grammar, punctuation, and glossary findings.</p>
           <div class="empty-actions">
-            <button id="emptyTranscriptButton" class="primary-button empty-check-button" type="button">Clean Transcript (OpenAI)</button>
-            <button id="emptyCheckButton" class="empty-check-button" type="button">Check Subtitles</button>
+            <button id="emptyTranscriptButton" class="primary-button empty-check-button" type="button">Check Transcript (OpenAI)</button>
           </div>
         </div>
         <ol id="issueList" class="issue-list"></ol>
@@ -96,10 +94,8 @@
           </div>
           <div id="engineSettingsPanel" class="engine-settings-panel">
             <div class="engine-settings-grid">
-              <select id="spellingEngineMode" aria-label="Spelling engine">
-                <option value="local" selected>Local Spelling</option>
-                <option value="openai">OpenAI Spelling</option>
-                <option value="openai_full">OpenAI Full QA</option>
+              <select id="spellingEngineMode" aria-label="Transcript engine">
+                <option value="openai_full" selected>OpenAI Transcript</option>
               </select>
               <input
                 id="openAiApiKey"
