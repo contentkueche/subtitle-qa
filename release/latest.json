@@ -1,7 +1,7 @@
 {
-  "version": "0.3.0",
+  "version": "0.3.1",
   "file": "com.subtitleqa.panel_premierepro.ccx",
   "ccxUrl": "https://raw.githubusercontent.com/contentkueche/subtitle-qa/main/release/com.subtitleqa.panel_premierepro.ccx",
-  "sha256": "9a17d0b08fc22e6af466052c5adbb14f44f20c159ad187219bc4d8123bf78246",
-  "notes": "Transcript-only release: removes Check Subtitles and disables caption/graphic scan paths to avoid cutter-machine crashes."
+  "sha256": "3b25cb15b89f723adc17526669304d041d62e412926e06bbcc80cc3a3f7e694e",
+  "notes": "Timing-stability release: transcript cleanup now preserves original word timings where possible and only interpolates inserted words locally."
 }

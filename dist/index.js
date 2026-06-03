@@ -3296,39 +3296,271 @@ ${safeJson(entry.data)}`;
     return nextWords;
   }
   function rewriteWordsWithTiming(originalWords, correctedText) {
-    const tokens = tokenizeTranscriptText(correctedText);
-    if (tokens.length === 0) {
+    const correctedTokens = tokenizeTranscriptText(correctedText);
+    if (correctedTokens.length === 0) {
       return void 0;
     }
-    const timedWords = originalWords.filter((word) => {
+    const originalGroups = buildTimedTokenGroups(originalWords);
+    if (originalGroups.length === 0) {
+      return void 0;
+    }
+    const alignment = alignCorrectedTokensToOriginalTiming(originalGroups, correctedTokens);
+    const averageConfidenceValue = averageGroupConfidence(originalGroups);
+    const segmentStart = originalGroups[0].start;
+    const segmentEnd = originalGroups.reduce((max2, group) => Math.max(max2, group.end), originalGroups[0].end);
+    if (!alignment.some((op) => op.correctedToken && op.original)) {
+      return interpolateInsertedTokens(correctedTokens, segmentStart, segmentEnd, averageConfidenceValue).map((word, index, words) => ({
+        ...word,
+        eos: index === words.length - 1
+      }));
+    }
+    const outputWords = [];
+    for (let index = 0; index < alignment.length; index += 1) {
+      const op = alignment[index];
+      if (!op.correctedToken) {
+        continue;
+      }
+      if (op.original) {
+        outputWords.push(wordFromTimedToken(op.correctedToken, op.original, op.original.confidence ?? averageConfidenceValue));
+        continue;
+      }
+      const insertedRunEnd = findInsertedRunEnd(alignment, index);
+      const insertedTokens = alignment.slice(index, insertedRunEnd).map((entry) => entry.correctedToken).filter(isString);
+      outputWords.push(
+        ...interpolateInsertedTokens(
+          insertedTokens,
+          previousAnchoredEnd(outputWords, segmentStart),
+          nextAnchoredStart(alignment, insertedRunEnd, segmentEnd),
+          averageConfidenceValue
+        )
+      );
+      index = insertedRunEnd - 1;
+    }
+    if (outputWords.length === 0) {
+      return void 0;
+    }
+    return outputWords.map((word, index) => ({
+      ...word,
+      eos: index === outputWords.length - 1
+    }));
+  }
+  function buildTimedTokenGroups(words) {
+    const groups = [];
+    let current;
+    let confidenceSum = 0;
+    let confidenceCount = 0;
+    const closeCurrent = () => {
+      if (!current) {
+        return;
+      }
+      groups.push({
+        ...current,
+        confidence: confidenceCount > 0 ? confidenceSum / confidenceCount : current.confidence
+      });
+      current = void 0;
+      confidenceSum = 0;
+      confidenceCount = 0;
+    };
+    for (const word of words) {
       const token = typeof word.text === "string" ? word.text.trim() : "";
-      return token.length > 0 && typeof word.start === "number" && typeof word.duration === "number";
-    });
-    if (timedWords.length === 0) {
-      return void 0;
+      if (!token || typeof word.start !== "number" || typeof word.duration !== "number") {
+        continue;
+      }
+      const start = word.start;
+      const end = word.start + Math.max(0, word.duration);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) {
+        continue;
+      }
+      const tokenType = typeof word.type === "string" ? word.type.toLowerCase() : "";
+      const attachesToPrevious = Boolean(current) && (tokenType === "punctuation" || isPunctuationToken(token) || /^[,.;:!?)]/.test(token) || /^[’']/.test(token));
+      if (!attachesToPrevious) {
+        closeCurrent();
+        current = {
+          confidence: word.confidence,
+          end: Math.max(end, start),
+          start,
+          text: token
+        };
+      } else if (current) {
+        current.text += token;
+        current.end = Math.max(current.end, end);
+      }
+      if (typeof word.confidence === "number" && Number.isFinite(word.confidence)) {
+        confidenceSum += word.confidence;
+        confidenceCount += 1;
+      }
     }
-    const firstStart = timedWords[0].start;
-    const lastEnd = timedWords.reduce((max2, word) => Math.max(max2, (word.start ?? 0) + Math.max(0, word.duration ?? 0)), firstStart ?? 0);
-    if (typeof firstStart !== "number" || !Number.isFinite(firstStart) || !Number.isFinite(lastEnd) || lastEnd <= firstStart) {
-      return void 0;
+    closeCurrent();
+    return groups.filter((group) => group.end >= group.start);
+  }
+  function alignCorrectedTokensToOriginalTiming(originalGroups, correctedTokens) {
+    const originalCount = originalGroups.length;
+    const correctedCount = correctedTokens.length;
+    const gapPenalty = -2;
+    const scores = Array.from({ length: originalCount + 1 }, () => Array(correctedCount + 1).fill(0));
+    const trace = Array.from({ length: originalCount + 1 }, () => Array(correctedCount + 1).fill("diag"));
+    for (let originalIndex2 = 1; originalIndex2 <= originalCount; originalIndex2 += 1) {
+      scores[originalIndex2][0] = scores[originalIndex2 - 1][0] + gapPenalty;
+      trace[originalIndex2][0] = "delete";
     }
-    const totalDuration = lastEnd - firstStart;
+    for (let correctedIndex2 = 1; correctedIndex2 <= correctedCount; correctedIndex2 += 1) {
+      scores[0][correctedIndex2] = scores[0][correctedIndex2 - 1] + gapPenalty;
+      trace[0][correctedIndex2] = "insert";
+    }
+    for (let originalIndex2 = 1; originalIndex2 <= originalCount; originalIndex2 += 1) {
+      for (let correctedIndex2 = 1; correctedIndex2 <= correctedCount; correctedIndex2 += 1) {
+        const similarity = tokenSimilarity(originalGroups[originalIndex2 - 1].text, correctedTokens[correctedIndex2 - 1]);
+        const diagonal = scores[originalIndex2 - 1][correctedIndex2 - 1] + similarity;
+        const deletion = scores[originalIndex2 - 1][correctedIndex2] + gapPenalty;
+        const insertion = scores[originalIndex2][correctedIndex2 - 1] + gapPenalty;
+        if (diagonal >= deletion && diagonal >= insertion) {
+          scores[originalIndex2][correctedIndex2] = diagonal;
+          trace[originalIndex2][correctedIndex2] = "diag";
+        } else if (deletion >= insertion) {
+          scores[originalIndex2][correctedIndex2] = deletion;
+          trace[originalIndex2][correctedIndex2] = "delete";
+        } else {
+          scores[originalIndex2][correctedIndex2] = insertion;
+          trace[originalIndex2][correctedIndex2] = "insert";
+        }
+      }
+    }
+    const ops = [];
+    let originalIndex = originalCount;
+    let correctedIndex = correctedCount;
+    while (originalIndex > 0 || correctedIndex > 0) {
+      const op = trace[originalIndex][correctedIndex];
+      if (originalIndex > 0 && correctedIndex > 0 && op === "diag") {
+        const original = originalGroups[originalIndex - 1];
+        const correctedToken = correctedTokens[correctedIndex - 1];
+        if (tokenSimilarity(original.text, correctedToken) > 0) {
+          ops.push({ correctedToken, original });
+        } else {
+          ops.push({ correctedToken });
+          ops.push({ original });
+        }
+        originalIndex -= 1;
+        correctedIndex -= 1;
+        continue;
+      }
+      if (originalIndex > 0 && (correctedIndex === 0 || op === "delete")) {
+        ops.push({ original: originalGroups[originalIndex - 1] });
+        originalIndex -= 1;
+        continue;
+      }
+      if (correctedIndex > 0) {
+        ops.push({ correctedToken: correctedTokens[correctedIndex - 1] });
+        correctedIndex -= 1;
+      }
+    }
+    return ops.reverse();
+  }
+  function tokenSimilarity(original, corrected) {
+    if (original === corrected) {
+      return 8;
+    }
+    const originalKey = normalizeTokenForAlignment(original);
+    const correctedKey = normalizeTokenForAlignment(corrected);
+    if (!originalKey || !correctedKey) {
+      return -5;
+    }
+    if (originalKey === correctedKey) {
+      return 7;
+    }
+    const distance = levenshteinDistance(originalKey, correctedKey, 3);
+    const maxLength = Math.max(originalKey.length, correctedKey.length);
+    if (distance === 1 && maxLength >= 4) {
+      return 5;
+    }
+    if (distance === 2 && maxLength >= 7) {
+      return 3;
+    }
+    if (distance <= 3 && maxLength >= 10) {
+      return 2;
+    }
+    return -5;
+  }
+  function normalizeTokenForAlignment(token) {
+    return token.toLocaleLowerCase("de-DE").normalize("NFKC").replace(/[^\p{L}\p{M}\p{N}]/gu, "");
+  }
+  function levenshteinDistance(left, right, maxDistance) {
+    if (Math.abs(left.length - right.length) > maxDistance) {
+      return maxDistance + 1;
+    }
+    let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+    for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+      const current = [leftIndex];
+      let rowMin = current[0];
+      for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+        const substitutionCost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1;
+        const value = Math.min(
+          previous[rightIndex] + 1,
+          current[rightIndex - 1] + 1,
+          previous[rightIndex - 1] + substitutionCost
+        );
+        current[rightIndex] = value;
+        rowMin = Math.min(rowMin, value);
+      }
+      if (rowMin > maxDistance) {
+        return maxDistance + 1;
+      }
+      previous = current;
+    }
+    return previous[right.length];
+  }
+  function wordFromTimedToken(token, timing, confidence) {
+    return {
+      confidence,
+      duration: Math.max(0, timing.end - timing.start),
+      eos: false,
+      start: timing.start,
+      text: token,
+      type: isPunctuationToken(token) ? "punctuation" : "word"
+    };
+  }
+  function findInsertedRunEnd(alignment, startIndex) {
+    let index = startIndex;
+    while (index < alignment.length && alignment[index].correctedToken && !alignment[index].original) {
+      index += 1;
+    }
+    return index;
+  }
+  function previousAnchoredEnd(outputWords, fallback) {
+    for (let index = outputWords.length - 1; index >= 0; index -= 1) {
+      const word = outputWords[index];
+      if (typeof word.start === "number" && typeof word.duration === "number") {
+        return word.start + Math.max(0, word.duration);
+      }
+    }
+    return fallback;
+  }
+  function nextAnchoredStart(alignment, startIndex, fallback) {
+    for (let index = startIndex; index < alignment.length; index += 1) {
+      const original = alignment[index].original;
+      if (original && alignment[index].correctedToken) {
+        return original.start;
+      }
+    }
+    return fallback;
+  }
+  function interpolateInsertedTokens(tokens, start, end, confidence) {
+    if (tokens.length === 0) {
+      return [];
+    }
+    const span = Math.max(0, end - start);
     const weights = tokens.map(tokenTimingWeight);
     const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
-    if (totalWeight <= 0) {
-      return void 0;
-    }
-    const confidence = averageConfidence(timedWords);
-    let cursor = firstStart;
+    const fallbackDuration = span > 0 ? span / tokens.length : 0;
+    let cursor = start;
     let consumedWeight = 0;
     return tokens.map((token, index) => {
       consumedWeight += weights[index];
-      const nextCursor = index === tokens.length - 1 ? lastEnd : firstStart + totalDuration * consumedWeight / totalWeight;
+      const nextCursor = span > 0 && totalWeight > 0 ? start + span * consumedWeight / totalWeight : cursor + fallbackDuration;
       const duration = Math.max(0, nextCursor - cursor);
       const word = {
         confidence,
         duration,
-        eos: index === tokens.length - 1,
+        eos: false,
         start: cursor,
         text: token,
         type: isPunctuationToken(token) ? "punctuation" : "word"
@@ -3341,12 +3573,15 @@ ${safeJson(entry.data)}`;
     const letters = token.replace(/[^\p{L}\p{M}\p{N}]/gu, "").length;
     return Math.max(1, letters);
   }
-  function averageConfidence(words) {
-    const values = words.map((word) => word.confidence).filter((value) => typeof value === "number" && Number.isFinite(value));
+  function averageGroupConfidence(groups) {
+    const values = groups.map((group) => group.confidence).filter((value) => typeof value === "number" && Number.isFinite(value));
     if (values.length === 0) {
       return 1;
     }
     return values.reduce((sum, value) => sum + value, 0) / values.length;
+  }
+  function isString(value) {
+    return typeof value === "string";
   }
   function hasUsableTiming(words) {
     return words.length > 0 && words.every((word) => typeof word.start === "number" && typeof word.duration === "number");
