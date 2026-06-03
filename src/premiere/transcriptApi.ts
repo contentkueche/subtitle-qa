@@ -1,5 +1,6 @@
 import type { Issue, TextTarget } from "../domain/models";
 import { Logger } from "../domain/logger";
+import { FULL_TRANSCRIPT_REWRITE_RULE_ID } from "../domain/openAiTranscriptCleanupEngine";
 import { applyIssueSet } from "../domain/textEdits";
 import type { PremiereContext } from "./premiereContext";
 import { looksLikeHumanText } from "./nativeScanner";
@@ -23,6 +24,7 @@ interface TranscriptJson {
 }
 
 interface SegmentUpdatePlan {
+  correctedText: string;
   issueCount: number;
   segmentIndex: number;
   updatedWords: TranscriptWord[];
@@ -104,7 +106,18 @@ export class TranscriptApiBridge {
       }
 
       const originalText = composeTranscriptText(segment.words);
-      const correctedText = applyIssueSet(originalText, segmentIssues);
+      const scanText = segmentIssues[0]?.originalText ?? "";
+      if (scanText && !sameTranscriptText(originalText, scanText)) {
+        this.logger.warn("Transcript segment changed after scan; skipping to avoid overwriting newer edits.", {
+          segmentIndex,
+          scanPreview: scanText.slice(0, 140),
+          currentPreview: originalText.slice(0, 140)
+        });
+        continue;
+      }
+
+      const fullRewriteIssue = segmentIssues.find((issue) => issue.ruleId === FULL_TRANSCRIPT_REWRITE_RULE_ID);
+      const correctedText = fullRewriteIssue ? fullRewriteIssue.replacement.replacement : applyIssueSet(originalText, segmentIssues);
       if (correctedText === originalText) {
         continue;
       }
@@ -114,13 +127,20 @@ export class TranscriptApiBridge {
         continue;
       }
 
-      const updatedWords = applyCorrectionToWords(segment.words, correctedText);
+      const updatedWords = fullRewriteIssue
+        ? rewriteWordsWithTiming(segment.words, correctedText)
+        : applyCorrectionToWords(segment.words, correctedText);
       if (!updatedWords) {
-        this.logger.warn("Skipping transcript segment because correction is not token-stable for the official Transcript API.", {
-          segmentIndex,
-          originalPreview: originalText.slice(0, 140),
-          correctedPreview: correctedText.slice(0, 140)
-        });
+        this.logger.warn(
+          fullRewriteIssue
+            ? "Skipping transcript segment because a timed full rewrite could not be generated."
+            : "Skipping transcript segment because correction is not token-stable for the official Transcript API.",
+          {
+            segmentIndex,
+            originalPreview: originalText.slice(0, 140),
+            correctedPreview: correctedText.slice(0, 140)
+          }
+        );
         continue;
       }
 
@@ -134,7 +154,13 @@ export class TranscriptApiBridge {
         continue;
       }
 
+      if (!hasUsableTiming(updatedWords)) {
+        this.logger.warn("Skipping transcript segment because generated words do not contain usable timing.", { segmentIndex });
+        continue;
+      }
+
       updatePlans.push({
+        correctedText,
         issueCount: segmentIssues.length,
         segmentIndex,
         updatedWords
@@ -166,6 +192,13 @@ export class TranscriptApiBridge {
 
     const fullAttempt = tryImportTranscript(context, transcript, clipProjectItems, this.logger);
     if (fullAttempt.success) {
+      const mismatches = await this.verifyImportedTranscript(context, updatePlans);
+      if (mismatches.length > 0) {
+        this.logger.error("Transcript import verification failed; restoring previous transcript JSON.", { mismatches });
+        tryImportTranscript(context, originalTranscript, clipProjectItems, this.logger);
+        throw new Error(`Transcript import verification failed for segment(s): ${mismatches.join(", ")}. Previous transcript was restored.`);
+      }
+
       this.logger.info("Official transcript API wrote corrected transcript segments.", {
         changedSegments: updatePlans.length,
         appliedIssues: totalIssueCount
@@ -181,6 +214,7 @@ export class TranscriptApiBridge {
     let currentTranscript = cloneTranscript(originalTranscript);
     let appliedIssueCount = 0;
     let appliedSegmentCount = 0;
+    const appliedPlans: SegmentUpdatePlan[] = [];
     const failedSegments: number[] = [];
 
     for (const plan of updatePlans) {
@@ -203,10 +237,18 @@ export class TranscriptApiBridge {
       currentTranscript = candidateTranscript;
       appliedSegmentCount += 1;
       appliedIssueCount += plan.issueCount;
+      appliedPlans.push(plan);
     }
 
     if (appliedSegmentCount === 0) {
       throw new Error(fullAttempt.errorMessage);
+    }
+
+    const mismatches = await this.verifyImportedTranscript(context, appliedPlans);
+    if (mismatches.length > 0) {
+      this.logger.error("Transcript import verification failed after segment fallback; restoring previous transcript JSON.", { mismatches });
+      tryImportTranscript(context, originalTranscript, clipProjectItems, this.logger);
+      throw new Error(`Transcript import verification failed for segment(s): ${mismatches.join(", ")}. Previous transcript was restored.`);
     }
 
     if (failedSegments.length > 0) {
@@ -223,6 +265,39 @@ export class TranscriptApiBridge {
     });
 
     return appliedIssueCount;
+  }
+
+  detectCaptionGenerationApis(context: PremiereContext): string[] {
+    const candidates = [
+      ...methodNames(context.ppro?.Transcript).map((name) => `ppro.Transcript.${name}`),
+      ...methodNames(context.ppro?.CaptionTrack).map((name) => `ppro.CaptionTrack.${name}`),
+      ...methodNames(context.ppro?.Caption).map((name) => `ppro.Caption.${name}`),
+      ...methodNames(context.sequence).map((name) => `sequence.${name}`)
+    ];
+
+    return candidates
+      .filter((name) => /(caption|subtitle)/i.test(name) && /(create|generate|import|add|insert)/i.test(name))
+      .sort();
+  }
+
+  private async verifyImportedTranscript(context: PremiereContext, plans: SegmentUpdatePlan[]): Promise<number[]> {
+    const payload = await this.exportTranscriptJson(context);
+    if (!payload) {
+      return plans.map((plan) => plan.segmentIndex);
+    }
+
+    const imported = parseTranscriptJson(payload);
+    const segments = imported.segments ?? [];
+    const mismatches: number[] = [];
+    for (const plan of plans) {
+      const words = segments[plan.segmentIndex]?.words;
+      const text = Array.isArray(words) ? composeTranscriptText(words) : "";
+      if (!sameTranscriptText(text, plan.correctedText)) {
+        mismatches.push(plan.segmentIndex);
+      }
+    }
+
+    return mismatches;
   }
 
   private async exportTranscriptJson(context: PremiereContext): Promise<string | undefined> {
@@ -455,6 +530,70 @@ function applyTokenStableCorrection(
   return nextWords;
 }
 
+function rewriteWordsWithTiming(originalWords: TranscriptWord[], correctedText: string): TranscriptWord[] | undefined {
+  const tokens = tokenizeTranscriptText(correctedText);
+  if (tokens.length === 0) {
+    return undefined;
+  }
+
+  const timedWords = originalWords.filter((word) => {
+    const token = typeof word.text === "string" ? word.text.trim() : "";
+    return token.length > 0 && typeof word.start === "number" && typeof word.duration === "number";
+  });
+  if (timedWords.length === 0) {
+    return undefined;
+  }
+
+  const firstStart = timedWords[0].start;
+  const lastEnd = timedWords.reduce((max, word) => Math.max(max, (word.start ?? 0) + Math.max(0, word.duration ?? 0)), firstStart ?? 0);
+  if (typeof firstStart !== "number" || !Number.isFinite(firstStart) || !Number.isFinite(lastEnd) || lastEnd <= firstStart) {
+    return undefined;
+  }
+
+  const totalDuration = lastEnd - firstStart;
+  const weights = tokens.map(tokenTimingWeight);
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  if (totalWeight <= 0) {
+    return undefined;
+  }
+
+  const confidence = averageConfidence(timedWords);
+  let cursor = firstStart;
+  let consumedWeight = 0;
+  return tokens.map((token, index) => {
+    consumedWeight += weights[index];
+    const nextCursor = index === tokens.length - 1 ? lastEnd : firstStart + (totalDuration * consumedWeight) / totalWeight;
+    const duration = Math.max(0, nextCursor - cursor);
+    const word: TranscriptWord = {
+      confidence,
+      duration,
+      eos: index === tokens.length - 1,
+      start: cursor,
+      text: token,
+      type: isPunctuationToken(token) ? "punctuation" : "word"
+    };
+    cursor = nextCursor;
+    return word;
+  });
+}
+
+function tokenTimingWeight(token: string): number {
+  const letters = token.replace(/[^\p{L}\p{M}\p{N}]/gu, "").length;
+  return Math.max(1, letters);
+}
+
+function averageConfidence(words: TranscriptWord[]): number {
+  const values = words.map((word) => word.confidence).filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  if (values.length === 0) {
+    return 1;
+  }
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function hasUsableTiming(words: TranscriptWord[]): boolean {
+  return words.length > 0 && words.every((word) => typeof word.start === "number" && typeof word.duration === "number");
+}
+
 function groupBySegment(issues: Issue[]): Map<number, Issue[]> {
   const groups = new Map<number, Issue[]>();
   for (const issue of issues) {
@@ -590,6 +729,24 @@ function dedupeObjects<T>(values: T[]): T[] {
     }
   }
   return next;
+}
+
+function methodNames(value: any): string[] {
+  if (!value) {
+    return [];
+  }
+
+  const names = new Set<string>();
+  let current = value;
+  while (current && current !== Object.prototype) {
+    for (const name of Object.getOwnPropertyNames(current)) {
+      if (name !== "constructor" && typeof value?.[name] === "function") {
+        names.add(name);
+      }
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  return [...names];
 }
 
 function hashString(value: string): string {

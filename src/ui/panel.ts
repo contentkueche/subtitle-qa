@@ -3,6 +3,7 @@ import { Logger } from "../domain/logger";
 import { defaultGlossary, parseGlossaryJson } from "../domain/glossary";
 import { MockCorrectionEngine } from "../domain/mockCorrectionEngine";
 import { OpenAiSpellingEngine } from "../domain/openAiSpellingEngine";
+import { FULL_TRANSCRIPT_REWRITE_RULE_ID, OpenAiTranscriptCleanupEngine } from "../domain/openAiTranscriptCleanupEngine";
 import { UxpFileSystem } from "../platform/fileSystem";
 import { NativePremiereScanner } from "../premiere/nativeScanner";
 import { ProjectFileFallback } from "../premiere/projectFileFallback";
@@ -28,6 +29,7 @@ export class SubtitleQAPanel {
   private readonly transcriptApi = new TranscriptApiBridge(this.logger);
   private readonly mockEngine = new MockCorrectionEngine();
   private readonly openAiSpelling = new OpenAiSpellingEngine();
+  private readonly openAiTranscriptCleanup = new OpenAiTranscriptCleanupEngine();
   private readonly applier = new FixApplier(this.fs, this.fallback, this.transcriptApi, this.logger);
 
   private glossary: Glossary = defaultGlossary;
@@ -186,33 +188,43 @@ export class SubtitleQAPanel {
         await context.project.save();
       }
 
-      // Prefer project-file transcript blocks for full transcript cleanup.
-      // They allow structural edits (insert/delete tokens), while the current
-      // official Transcript action path is constrained by token structure.
+      // Prefer the official Transcript API for full transcript cleanup. The
+      // apply path rebuilds timed transcript words from the corrected text and
+      // verifies the imported transcript before confirming the write.
+      try {
+        const apiTargets = await this.transcriptApi.scan(context);
+        if (apiTargets.length > 0) {
+          context.capability.projectFileFallback = "not-needed";
+          context.capability.notes.push("Using official Transcript API for full transcript cleanup.");
+          const captionGenerationApis = this.transcriptApi.detectCaptionGenerationApis(context);
+          if (captionGenerationApis.length > 0) {
+            context.capability.notes.push(`Detected possible caption-generation APIs: ${captionGenerationApis.join(", ")}`);
+            this.logger.info("Detected possible caption-generation APIs.", { methods: captionGenerationApis });
+          } else {
+            context.capability.notes.push(
+              "No public caption-generation API was detected in this Premiere UXP build; cleaned transcript import is supported, automatic subtitle generation is not yet exposed."
+            );
+            this.logger.warn("No public caption-generation API detected in this Premiere UXP build.");
+          }
+          return apiTargets;
+        }
+        this.logger.warn("Official Transcript API did not return text segments; falling back to project-file transcript scan.");
+      } catch (error) {
+        this.logger.warn("Official Transcript API scan failed; falling back to project-file transcript scan.", serializeError(error));
+      }
+
       try {
         const transcriptTargets = await this.fallback.scanTranscript(context.projectPath, context.sequenceName);
         if (transcriptTargets.length > 0) {
           context.capability.projectFileFallback = "available";
-          context.capability.notes.push("Using project-file transcript blocks for full transcript cleanup.");
+          context.capability.notes.push("Using project-file transcript blocks as fallback for transcript cleanup.");
           this.logger.info("Using project-file transcript targets for cleanup.", {
             targets: transcriptTargets.length
           });
           return transcriptTargets;
         }
       } catch (error) {
-        this.logger.warn("Project-file transcript scan failed; trying official Transcript API.", serializeError(error));
-      }
-
-      try {
-        const apiTargets = await this.transcriptApi.scan(context);
-        if (apiTargets.length > 0) {
-          context.capability.projectFileFallback = "not-needed";
-          context.capability.notes.push("Using official Transcript API for transcript cleanup.");
-          return apiTargets;
-        }
-        this.logger.warn("Official Transcript API did not return text segments; falling back to project-file scan.");
-      } catch (error) {
-        this.logger.warn("Official Transcript API scan failed; falling back to project-file scan.", serializeError(error));
+        this.logger.warn("Project-file transcript fallback scan failed.", serializeError(error));
       }
 
       context.capability.notes.push("Project-file transcript scan did not find writable transcript blocks.");
@@ -586,6 +598,24 @@ export class SubtitleQAPanel {
 
   private async checkIssues(targets: Issue["target"][], workflow: "subtitle" | "transcript"): Promise<Issue[]> {
     const localIssues = dedupeIssues(this.mockEngine.checkTargets(targets, this.glossary, this.scanLanguage));
+    if (workflow === "transcript") {
+      try {
+        const cleanupIssues = dedupeIssues(
+          await this.openAiTranscriptCleanup.cleanTargets(targets, this.scanLanguage, this.openAiSettings, this.glossary)
+        );
+        this.logger.info("OpenAI full transcript cleanup complete.", {
+          mode: "openai_full_transcript",
+          targets: targets.length,
+          cleanupIssues: cleanupIssues.length
+        });
+        return cleanupIssues;
+      } catch (error) {
+        this.logger.warn("OpenAI full transcript cleanup failed; using local fallback.", serializeError(error));
+        this.statusText.textContent = "OpenAI transcript cleanup failed; used local fallback.";
+        return localIssues;
+      }
+    }
+
     const mode = this.workflowEngineMode(workflow);
     if (mode === "local") {
       return localIssues;
@@ -607,7 +637,7 @@ export class SubtitleQAPanel {
           (issue) => !remoteRanges.has(`${issue.targetId}:${issue.replacement.start}:${issue.replacement.end}`)
         );
         const merged = dedupeIssues([...remoteIssues, ...localNonOverlapping]);
-        this.logger.info(workflow === "transcript" ? "OpenAI transcript cleanup complete." : "OpenAI full sentence QA complete.", {
+        this.logger.info("OpenAI full sentence QA complete.", {
           mode,
           localFallbackIssues: localFallbackIssues.length,
           remoteIssues: remoteIssues.length,
@@ -1165,6 +1195,10 @@ function insertionLocationLabel(issue: Issue): string {
 }
 
 function issuePreview(issue: Issue, mode: "before" | "after"): string {
+  if (issue.ruleId === FULL_TRANSCRIPT_REWRITE_RULE_ID) {
+    return displayChangeText(mode === "before" ? issue.originalText : issue.replacement.replacement, "(empty)");
+  }
+
   const source = issue.originalText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const { start, end, replacement } = issue.replacement;
   const radius = 28;
@@ -1348,6 +1382,10 @@ function serializeError(error: unknown): Record<string, string> {
 
 function isWritableIssue(issue: Issue): boolean {
   if (issue.target.source === "transcript-api") {
+    if (issue.ruleId === FULL_TRANSCRIPT_REWRITE_RULE_ID) {
+      return true;
+    }
+
     const corrected = applyReplacement(issue.originalText, issue.replacement);
     return transcriptTokenStructureCompatible(issue.originalText, corrected);
   }

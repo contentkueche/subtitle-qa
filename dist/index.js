@@ -883,6 +883,224 @@ ${safeJson(entry.data)}`;
     return "Sentence QA suggestion from OpenAI.";
   }
 
+  // src/domain/openAiTranscriptCleanupEngine.ts
+  var FULL_TRANSCRIPT_REWRITE_RULE_ID = "openai-transcript-rewrite";
+  var OpenAiTranscriptCleanupEngine = class {
+    constructor(endpoint = "https://api.openai.com/v1/responses", timeoutMs = 3e4) {
+      this.endpoint = endpoint;
+      this.timeoutMs = timeoutMs;
+    }
+    async cleanTargets(targets, language, settings, glossary) {
+      const apiKey = settings.apiKey.trim();
+      if (!apiKey) {
+        throw new Error("Clean Transcript needs an OpenAI API key in Engine Settings.");
+      }
+      const model = settings.model.trim() || "gpt-4.1-mini";
+      const responseJson = await this.postJson(buildRequestPayload2(targets, language, model, glossary), apiKey);
+      const parsed = parseCleanupResponse(responseJson);
+      const mapped = new Map(parsed.corrections.map((item) => [item.id, item]));
+      const issues = [];
+      for (const target of targets) {
+        const correction = mapped.get(target.id);
+        if (!correction) {
+          continue;
+        }
+        const corrected = normalizeReturnedTranscript(correction.corrected);
+        const original = normalizeReturnedTranscript(target.originalText);
+        if (!corrected || corrected === original || !isSafeTranscriptRewrite(original, corrected)) {
+          continue;
+        }
+        issues.push({
+          id: makeIssueId(target.id, FULL_TRANSCRIPT_REWRITE_RULE_ID, 0, target.originalText.length),
+          targetId: target.id,
+          type: "grammar",
+          severity: "warning",
+          ruleId: FULL_TRANSCRIPT_REWRITE_RULE_ID,
+          message: correction.note.trim() || "Full transcript cleanup from OpenAI.",
+          originalText: target.originalText,
+          suggestedText: corrected,
+          replacement: {
+            start: 0,
+            end: target.originalText.length,
+            replacement: corrected
+          },
+          status: "pending",
+          target
+        });
+      }
+      return issues;
+    }
+    async postJson(payload, apiKey) {
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : void 0;
+      const timeout = controller ? setTimeout(() => {
+        controller.abort();
+      }, this.timeoutMs) : void 0;
+      try {
+        const response = await fetch(this.endpoint, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify(payload),
+          signal: controller?.signal
+        });
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const body = await response.text();
+            detail = body ? ` ${body.slice(0, 400)}` : "";
+          } catch {
+          }
+          throw new Error(`OpenAI transcript cleanup failed with HTTP ${response.status}.${detail}`);
+        }
+        return await response.json();
+      } finally {
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+      }
+    }
+  };
+  function buildRequestPayload2(targets, language, model, glossary) {
+    const languageMode = language === "de" ? "German" : language === "en" ? "English" : "Auto-detect per transcript segment (German or English)";
+    const glossaryTerms = glossary.brandTerms.slice(0, 400).map((term) => ({
+      term: term.term,
+      preferred: term.preferred,
+      language: term.language ?? "both",
+      caseSensitive: term.caseSensitive ?? false,
+      note: term.note ?? ""
+    }));
+    return {
+      model,
+      input: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                "You clean Adobe Premiere transcript segments before captions are generated.",
+                "Correct spelling, grammar, punctuation, casing, repeated words, obvious ASR fragments, and broken spacing.",
+                "Keep the speaker's meaning, tone, language, and order. Do not invent facts.",
+                "Remove duplicated partial phrases only when they are clearly transcript artifacts.",
+                "Do not summarize. Do not make marketing copy. Do not rewrite style beyond making the transcript correct and readable.",
+                "For German, use natural written German punctuation and capitalization.",
+                "For English, use natural written English punctuation and capitalization.",
+                "Respect glossaryTerms exactly for brands, people, products, companies, and places.",
+                "If a proper name is not in glossaryTerms and you are uncertain, leave it unchanged.",
+                "Return one corrected text for every target id. Preserve paragraph breaks inside a target only if they are meaningful.",
+                "If a target needs no change, return the original text unchanged."
+              ].join(" ")
+            }
+          ]
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: JSON.stringify({
+                languageMode,
+                glossaryTerms,
+                targets: targets.map((target, index) => ({
+                  id: target.id,
+                  text: target.originalText,
+                  previousSegment: index > 0 ? targets[index - 1].originalText : "",
+                  nextSegment: index + 1 < targets.length ? targets[index + 1].originalText : ""
+                }))
+              })
+            }
+          ]
+        }
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "subtitle_qa_transcript_cleanup_response",
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              corrections: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    id: { type: "string" },
+                    corrected: { type: "string" },
+                    note: { type: "string" }
+                  },
+                  required: ["id", "corrected", "note"]
+                }
+              }
+            },
+            required: ["corrections"]
+          },
+          strict: true
+        }
+      }
+    };
+  }
+  function parseCleanupResponse(raw) {
+    const direct = raw?.output_text;
+    if (typeof direct === "string" && direct.trim()) {
+      return validateCleanupResponse(JSON.parse(direct));
+    }
+    if (Array.isArray(direct)) {
+      const joined = direct.filter((part) => typeof part === "string").join("");
+      if (joined.trim()) {
+        return validateCleanupResponse(JSON.parse(joined));
+      }
+    }
+    const output = Array.isArray(raw?.output) ? raw.output : [];
+    const textParts = [];
+    for (const item of output) {
+      const content = Array.isArray(item?.content) ? item.content : [];
+      for (const block of content) {
+        if (typeof block?.text === "string") {
+          textParts.push(block.text);
+        }
+      }
+    }
+    const combined = textParts.join("");
+    if (combined.trim()) {
+      return validateCleanupResponse(JSON.parse(combined));
+    }
+    throw new Error("OpenAI response did not contain parsable JSON transcript cleanup output.");
+  }
+  function validateCleanupResponse(value) {
+    if (!value || typeof value !== "object") {
+      throw new Error("OpenAI transcript cleanup JSON is not an object.");
+    }
+    const corrections = value.corrections;
+    if (!Array.isArray(corrections)) {
+      throw new Error("OpenAI transcript cleanup JSON is missing corrections[].");
+    }
+    return {
+      corrections: corrections.map((entry, index) => {
+        const item = entry;
+        if (typeof item?.id !== "string" || typeof item?.corrected !== "string" || typeof item?.note !== "string") {
+          throw new Error(`OpenAI transcript correction at index ${index} is invalid.`);
+        }
+        return { id: item.id, corrected: item.corrected, note: item.note };
+      })
+    };
+  }
+  function normalizeReturnedTranscript(value) {
+    return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+  function isSafeTranscriptRewrite(original, corrected) {
+    if (corrected.length < 2 || corrected.length > Math.max(120, original.length * 2.2)) {
+      return false;
+    }
+    if (!/[A-Za-zÀ-ÖØ-öø-ÿ]/.test(corrected)) {
+      return false;
+    }
+    return true;
+  }
+
   // node_modules/fflate/esm/browser.js
   var u8 = Uint8Array;
   var u16 = Uint16Array;
@@ -3333,7 +3551,17 @@ ${safeJson(entry.data)}`;
           continue;
         }
         const originalText = composeTranscriptText(segment.words);
-        const correctedText = applyIssueSet(originalText, segmentIssues);
+        const scanText = segmentIssues[0]?.originalText ?? "";
+        if (scanText && !sameTranscriptText(originalText, scanText)) {
+          this.logger.warn("Transcript segment changed after scan; skipping to avoid overwriting newer edits.", {
+            segmentIndex,
+            scanPreview: scanText.slice(0, 140),
+            currentPreview: originalText.slice(0, 140)
+          });
+          continue;
+        }
+        const fullRewriteIssue = segmentIssues.find((issue) => issue.ruleId === FULL_TRANSCRIPT_REWRITE_RULE_ID);
+        const correctedText = fullRewriteIssue ? fullRewriteIssue.replacement.replacement : applyIssueSet(originalText, segmentIssues);
         if (correctedText === originalText) {
           continue;
         }
@@ -3341,13 +3569,16 @@ ${safeJson(entry.data)}`;
           this.logger.warn("Refusing unsafe transcript correction.", { segmentIndex });
           continue;
         }
-        const updatedWords = applyCorrectionToWords(segment.words, correctedText);
+        const updatedWords = fullRewriteIssue ? rewriteWordsWithTiming(segment.words, correctedText) : applyCorrectionToWords(segment.words, correctedText);
         if (!updatedWords) {
-          this.logger.warn("Skipping transcript segment because correction is not token-stable for the official Transcript API.", {
-            segmentIndex,
-            originalPreview: originalText.slice(0, 140),
-            correctedPreview: correctedText.slice(0, 140)
-          });
+          this.logger.warn(
+            fullRewriteIssue ? "Skipping transcript segment because a timed full rewrite could not be generated." : "Skipping transcript segment because correction is not token-stable for the official Transcript API.",
+            {
+              segmentIndex,
+              originalPreview: originalText.slice(0, 140),
+              correctedPreview: correctedText.slice(0, 140)
+            }
+          );
           continue;
         }
         const roundTripText = composeTranscriptText(updatedWords);
@@ -3359,7 +3590,12 @@ ${safeJson(entry.data)}`;
           });
           continue;
         }
+        if (!hasUsableTiming(updatedWords)) {
+          this.logger.warn("Skipping transcript segment because generated words do not contain usable timing.", { segmentIndex });
+          continue;
+        }
         updatePlans.push({
+          correctedText,
           issueCount: segmentIssues.length,
           segmentIndex,
           updatedWords
@@ -3387,6 +3623,12 @@ ${safeJson(entry.data)}`;
       const totalIssueCount = updatePlans.reduce((sum, plan) => sum + plan.issueCount, 0);
       const fullAttempt = tryImportTranscript(context, transcript, clipProjectItems, this.logger);
       if (fullAttempt.success) {
+        const mismatches2 = await this.verifyImportedTranscript(context, updatePlans);
+        if (mismatches2.length > 0) {
+          this.logger.error("Transcript import verification failed; restoring previous transcript JSON.", { mismatches: mismatches2 });
+          tryImportTranscript(context, originalTranscript, clipProjectItems, this.logger);
+          throw new Error(`Transcript import verification failed for segment(s): ${mismatches2.join(", ")}. Previous transcript was restored.`);
+        }
         this.logger.info("Official transcript API wrote corrected transcript segments.", {
           changedSegments: updatePlans.length,
           appliedIssues: totalIssueCount
@@ -3400,6 +3642,7 @@ ${safeJson(entry.data)}`;
       let currentTranscript = cloneTranscript(originalTranscript);
       let appliedIssueCount = 0;
       let appliedSegmentCount = 0;
+      const appliedPlans = [];
       const failedSegments = [];
       for (const plan of updatePlans) {
         const candidateTranscript = cloneTranscript(currentTranscript);
@@ -3419,9 +3662,16 @@ ${safeJson(entry.data)}`;
         currentTranscript = candidateTranscript;
         appliedSegmentCount += 1;
         appliedIssueCount += plan.issueCount;
+        appliedPlans.push(plan);
       }
       if (appliedSegmentCount === 0) {
         throw new Error(fullAttempt.errorMessage);
+      }
+      const mismatches = await this.verifyImportedTranscript(context, appliedPlans);
+      if (mismatches.length > 0) {
+        this.logger.error("Transcript import verification failed after segment fallback; restoring previous transcript JSON.", { mismatches });
+        tryImportTranscript(context, originalTranscript, clipProjectItems, this.logger);
+        throw new Error(`Transcript import verification failed for segment(s): ${mismatches.join(", ")}. Previous transcript was restored.`);
       }
       if (failedSegments.length > 0) {
         this.logger.warn("Transcript apply completed with skipped segments.", {
@@ -3435,6 +3685,32 @@ ${safeJson(entry.data)}`;
         appliedIssues: appliedIssueCount
       });
       return appliedIssueCount;
+    }
+    detectCaptionGenerationApis(context) {
+      const candidates = [
+        ...methodNames(context.ppro?.Transcript).map((name) => `ppro.Transcript.${name}`),
+        ...methodNames(context.ppro?.CaptionTrack).map((name) => `ppro.CaptionTrack.${name}`),
+        ...methodNames(context.ppro?.Caption).map((name) => `ppro.Caption.${name}`),
+        ...methodNames(context.sequence).map((name) => `sequence.${name}`)
+      ];
+      return candidates.filter((name) => /(caption|subtitle)/i.test(name) && /(create|generate|import|add|insert)/i.test(name)).sort();
+    }
+    async verifyImportedTranscript(context, plans) {
+      const payload = await this.exportTranscriptJson(context);
+      if (!payload) {
+        return plans.map((plan) => plan.segmentIndex);
+      }
+      const imported = parseTranscriptJson(payload);
+      const segments = imported.segments ?? [];
+      const mismatches = [];
+      for (const plan of plans) {
+        const words = segments[plan.segmentIndex]?.words;
+        const text = Array.isArray(words) ? composeTranscriptText(words) : "";
+        if (!sameTranscriptText(text, plan.correctedText)) {
+          mismatches.push(plan.segmentIndex);
+        }
+      }
+      return mismatches;
     }
     async exportTranscriptJson(context) {
       const ppro = context.ppro;
@@ -3628,6 +3904,62 @@ ${safeJson(entry.data)}`;
     }
     return nextWords;
   }
+  function rewriteWordsWithTiming(originalWords, correctedText) {
+    const tokens = tokenizeTranscriptText(correctedText);
+    if (tokens.length === 0) {
+      return void 0;
+    }
+    const timedWords = originalWords.filter((word) => {
+      const token = typeof word.text === "string" ? word.text.trim() : "";
+      return token.length > 0 && typeof word.start === "number" && typeof word.duration === "number";
+    });
+    if (timedWords.length === 0) {
+      return void 0;
+    }
+    const firstStart = timedWords[0].start;
+    const lastEnd = timedWords.reduce((max2, word) => Math.max(max2, (word.start ?? 0) + Math.max(0, word.duration ?? 0)), firstStart ?? 0);
+    if (typeof firstStart !== "number" || !Number.isFinite(firstStart) || !Number.isFinite(lastEnd) || lastEnd <= firstStart) {
+      return void 0;
+    }
+    const totalDuration = lastEnd - firstStart;
+    const weights = tokens.map(tokenTimingWeight);
+    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+    if (totalWeight <= 0) {
+      return void 0;
+    }
+    const confidence = averageConfidence(timedWords);
+    let cursor = firstStart;
+    let consumedWeight = 0;
+    return tokens.map((token, index) => {
+      consumedWeight += weights[index];
+      const nextCursor = index === tokens.length - 1 ? lastEnd : firstStart + totalDuration * consumedWeight / totalWeight;
+      const duration = Math.max(0, nextCursor - cursor);
+      const word = {
+        confidence,
+        duration,
+        eos: index === tokens.length - 1,
+        start: cursor,
+        text: token,
+        type: isPunctuationToken(token) ? "punctuation" : "word"
+      };
+      cursor = nextCursor;
+      return word;
+    });
+  }
+  function tokenTimingWeight(token) {
+    const letters = token.replace(/[^\p{L}\p{M}\p{N}]/gu, "").length;
+    return Math.max(1, letters);
+  }
+  function averageConfidence(words) {
+    const values = words.map((word) => word.confidence).filter((value) => typeof value === "number" && Number.isFinite(value));
+    if (values.length === 0) {
+      return 1;
+    }
+    return values.reduce((sum, value) => sum + value, 0) / values.length;
+  }
+  function hasUsableTiming(words) {
+    return words.length > 0 && words.every((word) => typeof word.start === "number" && typeof word.duration === "number");
+  }
   function groupBySegment(issues) {
     const groups = /* @__PURE__ */ new Map();
     for (const issue of issues) {
@@ -3743,6 +4075,22 @@ ${safeJson(entry.data)}`;
     }
     return next;
   }
+  function methodNames(value) {
+    if (!value) {
+      return [];
+    }
+    const names = /* @__PURE__ */ new Set();
+    let current = value;
+    while (current && current !== Object.prototype) {
+      for (const name of Object.getOwnPropertyNames(current)) {
+        if (name !== "constructor" && typeof value?.[name] === "function") {
+          names.add(name);
+        }
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return [...names];
+  }
   function hashString2(value) {
     let hash = 5381;
     for (let index = 0; index < value.length; index += 1) {
@@ -3769,6 +4117,7 @@ ${safeJson(entry.data)}`;
       this.transcriptApi = new TranscriptApiBridge(this.logger);
       this.mockEngine = new MockCorrectionEngine();
       this.openAiSpelling = new OpenAiSpellingEngine();
+      this.openAiTranscriptCleanup = new OpenAiTranscriptCleanupEngine();
       this.applier = new FixApplier(this.fs, this.fallback, this.transcriptApi, this.logger);
       this.glossary = defaultGlossary;
       this.glossarySettings = defaultGlossarySettings();
@@ -3898,28 +4247,38 @@ ${safeJson(entry.data)}`;
           await context.project.save();
         }
         try {
+          const apiTargets = await this.transcriptApi.scan(context);
+          if (apiTargets.length > 0) {
+            context.capability.projectFileFallback = "not-needed";
+            context.capability.notes.push("Using official Transcript API for full transcript cleanup.");
+            const captionGenerationApis = this.transcriptApi.detectCaptionGenerationApis(context);
+            if (captionGenerationApis.length > 0) {
+              context.capability.notes.push(`Detected possible caption-generation APIs: ${captionGenerationApis.join(", ")}`);
+              this.logger.info("Detected possible caption-generation APIs.", { methods: captionGenerationApis });
+            } else {
+              context.capability.notes.push(
+                "No public caption-generation API was detected in this Premiere UXP build; cleaned transcript import is supported, automatic subtitle generation is not yet exposed."
+              );
+              this.logger.warn("No public caption-generation API detected in this Premiere UXP build.");
+            }
+            return apiTargets;
+          }
+          this.logger.warn("Official Transcript API did not return text segments; falling back to project-file transcript scan.");
+        } catch (error) {
+          this.logger.warn("Official Transcript API scan failed; falling back to project-file transcript scan.", serializeError(error));
+        }
+        try {
           const transcriptTargets = await this.fallback.scanTranscript(context.projectPath, context.sequenceName);
           if (transcriptTargets.length > 0) {
             context.capability.projectFileFallback = "available";
-            context.capability.notes.push("Using project-file transcript blocks for full transcript cleanup.");
+            context.capability.notes.push("Using project-file transcript blocks as fallback for transcript cleanup.");
             this.logger.info("Using project-file transcript targets for cleanup.", {
               targets: transcriptTargets.length
             });
             return transcriptTargets;
           }
         } catch (error) {
-          this.logger.warn("Project-file transcript scan failed; trying official Transcript API.", serializeError(error));
-        }
-        try {
-          const apiTargets = await this.transcriptApi.scan(context);
-          if (apiTargets.length > 0) {
-            context.capability.projectFileFallback = "not-needed";
-            context.capability.notes.push("Using official Transcript API for transcript cleanup.");
-            return apiTargets;
-          }
-          this.logger.warn("Official Transcript API did not return text segments; falling back to project-file scan.");
-        } catch (error) {
-          this.logger.warn("Official Transcript API scan failed; falling back to project-file scan.", serializeError(error));
+          this.logger.warn("Project-file transcript fallback scan failed.", serializeError(error));
         }
         context.capability.notes.push("Project-file transcript scan did not find writable transcript blocks.");
         this.logger.warn("TranscriptData not writable in this project; falling back to caption text blocks.");
@@ -4241,6 +4600,23 @@ ${safeJson(entry.data)}`;
     }
     async checkIssues(targets, workflow) {
       const localIssues = dedupeIssues(this.mockEngine.checkTargets(targets, this.glossary, this.scanLanguage));
+      if (workflow === "transcript") {
+        try {
+          const cleanupIssues = dedupeIssues(
+            await this.openAiTranscriptCleanup.cleanTargets(targets, this.scanLanguage, this.openAiSettings, this.glossary)
+          );
+          this.logger.info("OpenAI full transcript cleanup complete.", {
+            mode: "openai_full_transcript",
+            targets: targets.length,
+            cleanupIssues: cleanupIssues.length
+          });
+          return cleanupIssues;
+        } catch (error) {
+          this.logger.warn("OpenAI full transcript cleanup failed; using local fallback.", serializeError(error));
+          this.statusText.textContent = "OpenAI transcript cleanup failed; used local fallback.";
+          return localIssues;
+        }
+      }
       const mode = this.workflowEngineMode(workflow);
       if (mode === "local") {
         return localIssues;
@@ -4261,7 +4637,7 @@ ${safeJson(entry.data)}`;
             (issue) => !remoteRanges.has(`${issue.targetId}:${issue.replacement.start}:${issue.replacement.end}`)
           );
           const merged2 = dedupeIssues([...remoteIssues, ...localNonOverlapping]);
-          this.logger.info(workflow === "transcript" ? "OpenAI transcript cleanup complete." : "OpenAI full sentence QA complete.", {
+          this.logger.info("OpenAI full sentence QA complete.", {
             mode,
             localFallbackIssues: localFallbackIssues.length,
             remoteIssues: remoteIssues.length,
@@ -4701,7 +5077,19 @@ ${safeJson(entry.data)}`;
   function replacementText(issue) {
     return issuePreview(issue, "after");
   }
+  function displayChangeText(text, emptyLabel) {
+    if (text.length === 0) {
+      return emptyLabel;
+    }
+    if (/^\s+$/.test(text)) {
+      return `${text.length} space${text.length === 1 ? "" : "s"}`;
+    }
+    return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  }
   function issuePreview(issue, mode) {
+    if (issue.ruleId === FULL_TRANSCRIPT_REWRITE_RULE_ID) {
+      return displayChangeText(mode === "before" ? issue.originalText : issue.replacement.replacement, "(empty)");
+    }
     const source = issue.originalText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     const { start, end, replacement } = issue.replacement;
     const radius = 28;
@@ -4862,6 +5250,9 @@ ${safeJson(entry.data)}`;
   }
   function isWritableIssue(issue) {
     if (issue.target.source === "transcript-api") {
+      if (issue.ruleId === FULL_TRANSCRIPT_REWRITE_RULE_ID) {
+        return true;
+      }
       const corrected = applyReplacement(issue.originalText, issue.replacement);
       return transcriptTokenStructureCompatible(issue.originalText, corrected);
     }
