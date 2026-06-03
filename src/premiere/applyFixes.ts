@@ -19,7 +19,7 @@ export class FixApplier {
   async apply(
     context: PremiereContext,
     issues: Issue[],
-    options: { backupReuseKey?: string; allowTranscriptStructureChanges?: boolean } = {}
+    options: { backupReuseKey?: string } = {}
   ): Promise<ApplyResult> {
     const accepted = issues.filter((issue) => issue.status === "accepted");
     if (accepted.length === 0) {
@@ -53,9 +53,7 @@ export class FixApplier {
     }
 
     if (transcriptApiIssues.length > 0) {
-      appliedCount += await this.transcriptApi.apply(context, transcriptApiIssues, {
-        allowStructureChanges: options.allowTranscriptStructureChanges === true
-      });
+      appliedCount += await this.transcriptApi.apply(context, transcriptApiIssues);
     }
 
     if (projectFileIssues.length > 0) {

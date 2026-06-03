@@ -252,9 +252,6 @@ export class SubtitleQAPanel {
 
       let backupPath: string | undefined;
       let appliedWritable = 0;
-      let appliedReviewOnly = 0;
-      let reviewOnlyApplyFailed = false;
-      let reviewOnlyFailureMessage = "";
 
       if (writableAcceptedBeforeApply.length > 0) {
         const writableResult = await this.applier.apply(this.context, writableAcceptedBeforeApply, { backupReuseKey: this.scanRunKey });
@@ -273,46 +270,17 @@ export class SubtitleQAPanel {
       }
 
       if (reviewOnlyAcceptedBeforeApply.length > 0) {
-        try {
-          const reviewOnlyResult = await this.applier.apply(this.context, reviewOnlyAcceptedBeforeApply, {
-            backupReuseKey: this.scanRunKey,
-            allowTranscriptStructureChanges: true
-          });
-          appliedReviewOnly = reviewOnlyResult.appliedCount;
-          if (!backupPath) {
-            backupPath = reviewOnlyResult.backupPath;
-          }
-          if (appliedReviewOnly >= reviewOnlyAcceptedBeforeApply.length) {
-            for (const issue of reviewOnlyAcceptedBeforeApply) {
-              issue.status = "applied";
-            }
-          } else {
-            this.logger.warn("Review-only apply was partial; some accepted issues remain manual.", {
-              accepted: reviewOnlyAcceptedBeforeApply.length,
-              applied: appliedReviewOnly
-            });
-          }
-        } catch (error) {
-          reviewOnlyApplyFailed = true;
-          reviewOnlyFailureMessage = error instanceof Error ? error.message : String(error);
-          this.logger.warn("Review-only transcript apply failed; keeping manual queue.", serializeError(error));
-        }
-      }
-
-      const totalApplied = appliedWritable + appliedReviewOnly;
-      const remainingManual =
-        reviewOnlyAcceptedBeforeApply.length > appliedReviewOnly ? reviewOnlyAcceptedBeforeApply.length - appliedReviewOnly : 0;
-      if (remainingManual > 0 || reviewOnlyApplyFailed) {
         this.logManualApplyQueue(reviewOnlyAcceptedBeforeApply);
       }
+
+      const totalApplied = appliedWritable;
+      const remainingManual = reviewOnlyAcceptedBeforeApply.length;
 
       if (totalApplied === 0) {
         this.statusText.textContent = reviewOnlyAcceptedBeforeApply.length > 0
           ? `Accepted ${reviewOnlyAcceptedBeforeApply.length} review-only issue${
               reviewOnlyAcceptedBeforeApply.length === 1 ? "" : "s"
-            }. Premiere rejected structure-changing transcript apply${
-              reviewOnlyFailureMessage ? ` (${reviewOnlyFailureMessage})` : ""
-            }.`
+            }. Auto-apply skipped because Premiere requires token-stable transcript edits.`
           : "Apply finished, but no accepted fixes could be written.";
       } else {
         this.statusText.textContent =
@@ -324,7 +292,7 @@ export class SubtitleQAPanel {
       this.logger.info("Apply complete.", {
         appliedCount: totalApplied,
         appliedWritable,
-        appliedReviewOnly,
+        appliedReviewOnly: 0,
         remainingManual,
         backupPath
       });

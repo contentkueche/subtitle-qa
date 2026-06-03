@@ -38,10 +38,6 @@ interface TranscriptImportActionResult {
   errorMessage: string;
 }
 
-interface ApplyTranscriptOptions {
-  allowStructureChanges?: boolean;
-}
-
 export class TranscriptApiBridge {
   constructor(private readonly logger: Logger) {}
 
@@ -84,7 +80,7 @@ export class TranscriptApiBridge {
     return targets;
   }
 
-  async apply(context: PremiereContext, issues: Issue[], options: ApplyTranscriptOptions = {}): Promise<number> {
+  async apply(context: PremiereContext, issues: Issue[]): Promise<number> {
     if (issues.length === 0) {
       return 0;
     }
@@ -118,12 +114,22 @@ export class TranscriptApiBridge {
         continue;
       }
 
-      const updatedWords = applyCorrectionToWords(segment.words, correctedText, options.allowStructureChanges === true);
+      const updatedWords = applyCorrectionToWords(segment.words, correctedText);
       if (!updatedWords) {
-        this.logger.warn("Skipping transcript segment because correction would change token structure.", {
+        this.logger.warn("Skipping transcript segment because correction is not token-stable for the official Transcript API.", {
           segmentIndex,
           originalPreview: originalText.slice(0, 140),
           correctedPreview: correctedText.slice(0, 140)
+        });
+        continue;
+      }
+
+      const roundTripText = composeTranscriptText(updatedWords);
+      if (!sameTranscriptText(roundTripText, correctedText)) {
+        this.logger.warn("Skipping transcript segment because token roundtrip did not match the intended correction.", {
+          segmentIndex,
+          correctedPreview: correctedText.slice(0, 140),
+          roundTripPreview: roundTripText.slice(0, 140)
         });
         continue;
       }
@@ -405,11 +411,7 @@ function tokenizeTranscriptText(text: string): string[] {
   return tokens ? [...tokens] : [];
 }
 
-function applyCorrectionToWords(
-  originalWords: TranscriptWord[],
-  correctedText: string,
-  allowStructureChanges: boolean
-): TranscriptWord[] | undefined {
+function applyCorrectionToWords(originalWords: TranscriptWord[], correctedText: string): TranscriptWord[] | undefined {
   const textWordIndices: number[] = [];
   const originalTokens: string[] = [];
   for (let index = 0; index < originalWords.length; index += 1) {
@@ -430,11 +432,7 @@ function applyCorrectionToWords(
     return applyTokenStableCorrection(originalWords, textWordIndices, tokens);
   }
 
-  if (!allowStructureChanges) {
-    return undefined;
-  }
-
-  return applyStructureChangeCorrection(originalWords, textWordIndices, tokens);
+  return undefined;
 }
 
 function applyTokenStableCorrection(
@@ -455,76 +453,6 @@ function applyTokenStableCorrection(
     nextWords[wordIndex] = { ...nextWords[wordIndex], text: token };
   }
   return nextWords;
-}
-
-function applyStructureChangeCorrection(
-  originalWords: TranscriptWord[],
-  textWordIndices: number[],
-  correctedTokens: string[]
-): TranscriptWord[] | undefined {
-  if (textWordIndices.length === 0) {
-    return undefined;
-  }
-
-  const mappedTokens = mapTokensToFixedWordSlots(correctedTokens, textWordIndices.length);
-  if (mappedTokens.length !== textWordIndices.length) {
-    return undefined;
-  }
-
-  const nextWords = cloneWords(originalWords);
-  for (let slot = 0; slot < textWordIndices.length; slot += 1) {
-    const wordIndex = textWordIndices[slot];
-    const mapped = mappedTokens[slot] ?? "";
-    const current = nextWords[wordIndex] ?? {};
-    const nextWord: TranscriptWord = { ...current, text: mapped };
-    if (mapped) {
-      nextWord.type = isPunctuationToken(mapped) ? "punctuation" : "word";
-    }
-    nextWord.eos = false;
-    nextWords[wordIndex] = nextWord;
-  }
-
-  const eosIndex = findLastNonEmptyMappedSlot(mappedTokens);
-  if (eosIndex >= 0) {
-    const wordIndex = textWordIndices[eosIndex];
-    nextWords[wordIndex] = { ...nextWords[wordIndex], eos: true };
-  }
-
-  return nextWords;
-}
-
-function mapTokensToFixedWordSlots(tokens: string[], slots: number): string[] {
-  if (slots <= 0 || tokens.length === 0) {
-    return [];
-  }
-
-  if (tokens.length === slots) {
-    return [...tokens];
-  }
-
-  if (tokens.length < slots) {
-    const padded = [...tokens];
-    while (padded.length < slots) {
-      padded.push("");
-    }
-    return padded;
-  }
-
-  const mapped = new Array<string>(slots).fill("");
-  for (let index = 0; index < slots - 1; index += 1) {
-    mapped[index] = tokens[index] ?? "";
-  }
-  mapped[slots - 1] = tokens.slice(slots - 1).join(" ").trim();
-  return mapped;
-}
-
-function findLastNonEmptyMappedSlot(mappedTokens: string[]): number {
-  for (let index = mappedTokens.length - 1; index >= 0; index -= 1) {
-    if ((mappedTokens[index] ?? "").trim().length > 0) {
-      return index;
-    }
-  }
-  return -1;
 }
 
 function groupBySegment(issues: Issue[]): Map<number, Issue[]> {
@@ -670,4 +598,12 @@ function hashString(value: string): string {
     hash = (hash * 33) ^ value.charCodeAt(index);
   }
   return (hash >>> 0).toString(36);
+}
+
+function sameTranscriptText(left: string, right: string): boolean {
+  return normalizeTranscriptText(left) === normalizeTranscriptText(right);
+}
+
+function normalizeTranscriptText(value: string): string {
+  return value.replace(/\s+/g, " ").replace(/\s+([,.;:!?])/g, "$1").trim();
 }

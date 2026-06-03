@@ -3098,9 +3098,7 @@ ${safeJson(entry.data)}`;
         appliedCount += await this.applyNative(context, nativeIssues);
       }
       if (transcriptApiIssues.length > 0) {
-        appliedCount += await this.transcriptApi.apply(context, transcriptApiIssues, {
-          allowStructureChanges: options.allowTranscriptStructureChanges === true
-        });
+        appliedCount += await this.transcriptApi.apply(context, transcriptApiIssues);
       }
       if (projectFileIssues.length > 0) {
         if (!context.projectPath) {
@@ -3315,7 +3313,7 @@ ${safeJson(entry.data)}`;
       });
       return targets;
     }
-    async apply(context, issues, options = {}) {
+    async apply(context, issues) {
       if (issues.length === 0) {
         return 0;
       }
@@ -3343,12 +3341,21 @@ ${safeJson(entry.data)}`;
           this.logger.warn("Refusing unsafe transcript correction.", { segmentIndex });
           continue;
         }
-        const updatedWords = applyCorrectionToWords(segment.words, correctedText, options.allowStructureChanges === true);
+        const updatedWords = applyCorrectionToWords(segment.words, correctedText);
         if (!updatedWords) {
-          this.logger.warn("Skipping transcript segment because correction would change token structure.", {
+          this.logger.warn("Skipping transcript segment because correction is not token-stable for the official Transcript API.", {
             segmentIndex,
             originalPreview: originalText.slice(0, 140),
             correctedPreview: correctedText.slice(0, 140)
+          });
+          continue;
+        }
+        const roundTripText = composeTranscriptText(updatedWords);
+        if (!sameTranscriptText(roundTripText, correctedText)) {
+          this.logger.warn("Skipping transcript segment because token roundtrip did not match the intended correction.", {
+            segmentIndex,
+            correctedPreview: correctedText.slice(0, 140),
+            roundTripPreview: roundTripText.slice(0, 140)
           });
           continue;
         }
@@ -3586,7 +3593,7 @@ ${safeJson(entry.data)}`;
     const tokens = text.match(/[^\s]+/g);
     return tokens ? [...tokens] : [];
   }
-  function applyCorrectionToWords(originalWords, correctedText, allowStructureChanges) {
+  function applyCorrectionToWords(originalWords, correctedText) {
     const textWordIndices = [];
     const originalTokens = [];
     for (let index = 0; index < originalWords.length; index += 1) {
@@ -3604,10 +3611,7 @@ ${safeJson(entry.data)}`;
     if (tokens.length === originalTokens.length) {
       return applyTokenStableCorrection(originalWords, textWordIndices, tokens);
     }
-    if (!allowStructureChanges) {
-      return void 0;
-    }
-    return applyStructureChangeCorrection(originalWords, textWordIndices, tokens);
+    return void 0;
   }
   function applyTokenStableCorrection(originalWords, textWordIndices, tokens) {
     const nextWords = cloneWords(originalWords);
@@ -3623,62 +3627,6 @@ ${safeJson(entry.data)}`;
       nextWords[wordIndex] = { ...nextWords[wordIndex], text: token };
     }
     return nextWords;
-  }
-  function applyStructureChangeCorrection(originalWords, textWordIndices, correctedTokens) {
-    if (textWordIndices.length === 0) {
-      return void 0;
-    }
-    const mappedTokens = mapTokensToFixedWordSlots(correctedTokens, textWordIndices.length);
-    if (mappedTokens.length !== textWordIndices.length) {
-      return void 0;
-    }
-    const nextWords = cloneWords(originalWords);
-    for (let slot = 0; slot < textWordIndices.length; slot += 1) {
-      const wordIndex = textWordIndices[slot];
-      const mapped = mappedTokens[slot] ?? "";
-      const current = nextWords[wordIndex] ?? {};
-      const nextWord = { ...current, text: mapped };
-      if (mapped) {
-        nextWord.type = isPunctuationToken(mapped) ? "punctuation" : "word";
-      }
-      nextWord.eos = false;
-      nextWords[wordIndex] = nextWord;
-    }
-    const eosIndex = findLastNonEmptyMappedSlot(mappedTokens);
-    if (eosIndex >= 0) {
-      const wordIndex = textWordIndices[eosIndex];
-      nextWords[wordIndex] = { ...nextWords[wordIndex], eos: true };
-    }
-    return nextWords;
-  }
-  function mapTokensToFixedWordSlots(tokens, slots) {
-    if (slots <= 0 || tokens.length === 0) {
-      return [];
-    }
-    if (tokens.length === slots) {
-      return [...tokens];
-    }
-    if (tokens.length < slots) {
-      const padded = [...tokens];
-      while (padded.length < slots) {
-        padded.push("");
-      }
-      return padded;
-    }
-    const mapped = new Array(slots).fill("");
-    for (let index = 0; index < slots - 1; index += 1) {
-      mapped[index] = tokens[index] ?? "";
-    }
-    mapped[slots - 1] = tokens.slice(slots - 1).join(" ").trim();
-    return mapped;
-  }
-  function findLastNonEmptyMappedSlot(mappedTokens) {
-    for (let index = mappedTokens.length - 1; index >= 0; index -= 1) {
-      if ((mappedTokens[index] ?? "").trim().length > 0) {
-        return index;
-      }
-    }
-    return -1;
   }
   function groupBySegment(issues) {
     const groups = /* @__PURE__ */ new Map();
@@ -3801,6 +3749,12 @@ ${safeJson(entry.data)}`;
       hash = hash * 33 ^ value.charCodeAt(index);
     }
     return (hash >>> 0).toString(36);
+  }
+  function sameTranscriptText(left, right) {
+    return normalizeTranscriptText(left) === normalizeTranscriptText(right);
+  }
+  function normalizeTranscriptText(value) {
+    return value.replace(/\s+/g, " ").replace(/\s+([,.;:!?])/g, "$1").trim();
   }
 
   // src/ui/panel.ts
@@ -3999,9 +3953,6 @@ ${safeJson(entry.data)}`;
         }
         let backupPath;
         let appliedWritable = 0;
-        let appliedReviewOnly = 0;
-        let reviewOnlyApplyFailed = false;
-        let reviewOnlyFailureMessage = "";
         if (writableAcceptedBeforeApply.length > 0) {
           const writableResult = await this.applier.apply(this.context, writableAcceptedBeforeApply, { backupReuseKey: this.scanRunKey });
           appliedWritable = writableResult.appliedCount;
@@ -4018,45 +3969,19 @@ ${safeJson(entry.data)}`;
           }
         }
         if (reviewOnlyAcceptedBeforeApply.length > 0) {
-          try {
-            const reviewOnlyResult = await this.applier.apply(this.context, reviewOnlyAcceptedBeforeApply, {
-              backupReuseKey: this.scanRunKey,
-              allowTranscriptStructureChanges: true
-            });
-            appliedReviewOnly = reviewOnlyResult.appliedCount;
-            if (!backupPath) {
-              backupPath = reviewOnlyResult.backupPath;
-            }
-            if (appliedReviewOnly >= reviewOnlyAcceptedBeforeApply.length) {
-              for (const issue of reviewOnlyAcceptedBeforeApply) {
-                issue.status = "applied";
-              }
-            } else {
-              this.logger.warn("Review-only apply was partial; some accepted issues remain manual.", {
-                accepted: reviewOnlyAcceptedBeforeApply.length,
-                applied: appliedReviewOnly
-              });
-            }
-          } catch (error) {
-            reviewOnlyApplyFailed = true;
-            reviewOnlyFailureMessage = error instanceof Error ? error.message : String(error);
-            this.logger.warn("Review-only transcript apply failed; keeping manual queue.", serializeError(error));
-          }
-        }
-        const totalApplied = appliedWritable + appliedReviewOnly;
-        const remainingManual = reviewOnlyAcceptedBeforeApply.length > appliedReviewOnly ? reviewOnlyAcceptedBeforeApply.length - appliedReviewOnly : 0;
-        if (remainingManual > 0 || reviewOnlyApplyFailed) {
           this.logManualApplyQueue(reviewOnlyAcceptedBeforeApply);
         }
+        const totalApplied = appliedWritable;
+        const remainingManual = reviewOnlyAcceptedBeforeApply.length;
         if (totalApplied === 0) {
-          this.statusText.textContent = reviewOnlyAcceptedBeforeApply.length > 0 ? `Accepted ${reviewOnlyAcceptedBeforeApply.length} review-only issue${reviewOnlyAcceptedBeforeApply.length === 1 ? "" : "s"}. Premiere rejected structure-changing transcript apply${reviewOnlyFailureMessage ? ` (${reviewOnlyFailureMessage})` : ""}.` : "Apply finished, but no accepted fixes could be written.";
+          this.statusText.textContent = reviewOnlyAcceptedBeforeApply.length > 0 ? `Accepted ${reviewOnlyAcceptedBeforeApply.length} review-only issue${reviewOnlyAcceptedBeforeApply.length === 1 ? "" : "s"}. Auto-apply skipped because Premiere requires token-stable transcript edits.` : "Apply finished, but no accepted fixes could be written.";
         } else {
           this.statusText.textContent = `Applied ${totalApplied} accepted fix${totalApplied === 1 ? "" : "es"}${backupPath ? ` (backup: ${backupPath})` : ""}.` + (remainingManual > 0 ? ` ${remainingManual} accepted review-only issue${remainingManual === 1 ? "" : "s"} still need manual apply.` : "");
         }
         this.logger.info("Apply complete.", {
           appliedCount: totalApplied,
           appliedWritable,
-          appliedReviewOnly,
+          appliedReviewOnly: 0,
           remainingManual,
           backupPath
         });

@@ -2,7 +2,7 @@
 
 ## Current Release
 
-- Version: `0.1.38`
+- Version: `0.1.39`
 - CCX: `release/com.subtitleqa.panel_premierepro.ccx`
 - Manifest: `release/latest.json`
 - Central glossary: `contentkueche / Dokumente / General / 00_COMPANY_BRAIN / subtitle-qa-glossary.json`
